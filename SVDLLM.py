@@ -1480,8 +1480,8 @@ def _spectrum_meta(args, grad_nsamples, grad_seq_len, grad_fingerprint=0):
         "model_seq_len": args.model_seq_len,
         "grad_seq_len": grad_seq_len,
         "seed": args.seed,
-        "use_grad_g": bool(args.use_grad_g),
-        "g_block_diag": bool(args.g_block_diag),
+        "use_grad_g": bool(getattr(args, "use_grad_g", False)),
+        "g_block_diag": bool(getattr(args, "g_block_diag", False)),
         "attn_block_size": int(args.attn_block_size),
         "mlp_block_size": int(args.mlp_block_size),
         "grad_inv_max": args.grad_inv_max,
@@ -2032,13 +2032,33 @@ def _obtain_grad_diag(args, model, tokenizer, cali_white_data=None):
     grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
     grad_seq_len = args.grad_seq_len if args.grad_seq_len is not None else args.model_seq_len
     grad_batch_size = args.grad_batch_size if args.grad_batch_size is not None else 1
-    if cali_white_data is not None and grad_seq_len == args.model_seq_len and grad_batch_size == 1:
-        cali_grad_data = cali_white_data
+    # Need enough batches for max_batches=grad_nsamples. get_calib_train_data's
+    # `nsamples` argument is token-window count before batch packing, so with
+    # batch_size>1 we must request grad_nsamples*batch_size windows to obtain
+    # ~grad_nsamples packed batches.
+    need_windows = grad_nsamples * max(1, grad_batch_size)
+    can_reuse_white = (
+        cali_white_data is not None
+        and grad_seq_len == args.model_seq_len
+        and grad_batch_size == 1
+        and len(cali_white_data) >= grad_nsamples
+    )
+    if can_reuse_white:
+        cali_grad_data = cali_white_data[:grad_nsamples]
     else:
-        cali_grad_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=grad_seq_len, batch_size=grad_batch_size)
+        cali_grad_data = get_calib_train_data(
+            args.dataset,
+            tokenizer,
+            need_windows,
+            seqlen=grad_seq_len,
+            batch_size=grad_batch_size,
+        )
+    if len(cali_grad_data) < grad_nsamples:
+        print(f"[grad_diag] WARNING: requested grad_nsamples={grad_nsamples}, "
+              f"but only {len(cali_grad_data)} grad batches are available.")
     grad_diag = profile_grad_diag(
         args.model, model, cali_grad_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
-        block_diag=args.g_block_diag, attn_block_size=args.attn_block_size, mlp_block_size=args.mlp_block_size,
+        block_diag=getattr(args, "g_block_diag", False), attn_block_size=args.attn_block_size, mlp_block_size=args.mlp_block_size,
         use_checkpointing=args.grad_checkpointing, grad_inv_max=args.grad_inv_max,
         g_center=getattr(args, "g_center", False),
         g_seq_level=getattr(args, "g_seq_level", False),
@@ -2064,6 +2084,349 @@ def _obtain_layer_ratios(args, model, grad_diag):
     return layer_ratios
 
 
+def _get_transformer_layers(model_name, model):
+    if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
+        return model.model.layers
+    if "opt" in model_name:
+        return model.model.decoder.layers
+    return None
+
+
+@torch.no_grad()
+def _eval_calib_loss(model, calib_data, dev, max_batches=None):
+    prev_use_cache = getattr(model.config, "use_cache", None)
+    if prev_use_cache is not None:
+        model.config.use_cache = False
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    for bi, batch in enumerate(calib_data):
+        if max_batches is not None and bi >= max_batches:
+            break
+        batch = {k: v.to(dev) for k, v in batch.items()}
+        labels = batch["input_ids"]
+        outputs = model(
+            **batch,
+            labels=labels,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+        )
+        loss_val = float(outputs.loss.item())
+        ntok = int(labels.numel())
+        total_loss += loss_val * ntok
+        total_tokens += ntok
+    if prev_use_cache is not None:
+        model.config.use_cache = prev_use_cache
+    if total_tokens <= 0:
+        return float("inf")
+    return total_loss / total_tokens
+
+
+def _rank_from_ratio(m, n, ratio, max_rank=None):
+    k = int(m * n * ratio / (m + n))
+    k = max(1, min(k, min(m, n)))
+    if max_rank is not None:
+        k = min(k, int(max_rank))
+    return k
+
+
+@torch.no_grad()
+def _low_rank_weight_from_ratio(module, ratio, dev, scaling_diag_matrix=None, grad_entry=None, grad_eps=1e-6, grad_inv_max=None, g_sigma_space=False, g_blend_alpha=1.0, max_rank=None):
+    W = module.weight.data.float().to(dev).clone()
+    g_inv_sqrt = None
+    g_blocks = None
+    if grad_entry is not None:
+        if isinstance(grad_entry, dict) and grad_entry.get("type") == "block":
+            g_blocks = []
+            min_eig = _min_eig_value(grad_inv_max, grad_eps)
+            for b in grad_entry["blocks"]:
+                s, e = b["start"], b["end"]
+                mat = b["mat"].to(dev)
+                mat = _shift_psd_min_eig(mat, min_eig)
+                if g_sigma_space:
+                    W_block = W[s:e, :].clone()
+                    U_j, S_j, Vh_j = torch.linalg.svd(W_block, full_matrices=False)
+                    mat_sigma = U_j.t().matmul(mat).matmul(U_j)
+                    chol_sigma = _safe_cholesky(mat_sigma, grad_eps)
+                    inv_chol_sigma = torch.linalg.inv(chol_sigma)
+                    W[s:e, :] = chol_sigma.matmul(torch.diag(S_j).matmul(Vh_j))
+                    g_inv_sqrt_block = U_j.matmul(inv_chol_sigma)
+                elif g_blend_alpha < 1.0:
+                    chol = _safe_cholesky(mat, grad_eps)
+                    mean_eig_val = float(torch.linalg.eigvalsh(mat).mean().item())
+                    uniform_scale = math.sqrt(max(mean_eig_val, grad_eps))
+                    blk_sz = e - s
+                    if g_blend_alpha <= 0.0:
+                        chol_blend = uniform_scale * torch.eye(blk_sz, device=dev, dtype=chol.dtype)
+                    else:
+                        eye = torch.eye(blk_sz, device=dev, dtype=chol.dtype)
+                        chol_blend = g_blend_alpha * chol + (1.0 - g_blend_alpha) * uniform_scale * eye
+                    inv_chol_blend = torch.linalg.inv(chol_blend)
+                    W[s:e, :] = chol_blend.matmul(W[s:e, :])
+                    g_inv_sqrt_block = inv_chol_blend
+                else:
+                    chol = _safe_cholesky(mat, grad_eps)
+                    inv_chol = torch.linalg.inv(chol)
+                    W[s:e, :] = chol.matmul(W[s:e, :])
+                    g_inv_sqrt_block = inv_chol
+                g_blocks.append({"start": s, "end": e, "g_inv_sqrt": g_inv_sqrt_block})
+        else:
+            g_diag = grad_entry.to(dev)
+            min_eig = _min_eig_value(grad_inv_max, grad_eps)
+            g_diag = torch.clamp(g_diag, min=min_eig)
+            g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
+            g_inv_sqrt = 1.0 / g_sqrt
+            W = W * g_sqrt.unsqueeze(1)
+
+    scaling_inv = None
+    if scaling_diag_matrix is not None:
+        scaling_diag_matrix = scaling_diag_matrix.to(dev).float()
+        try:
+            scaling_inv = torch.linalg.inv(scaling_diag_matrix)
+        except Exception:
+            scaling_diag_matrix = scaling_diag_matrix + 1e-6 * torch.eye(
+                scaling_diag_matrix.shape[0], device=dev, dtype=scaling_diag_matrix.dtype
+            )
+            scaling_inv = torch.linalg.inv(scaling_diag_matrix)
+        W_scale = torch.matmul(W, scaling_diag_matrix)
+    else:
+        W_scale = W
+
+    U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
+    m, n = W.shape
+    k = _rank_from_ratio(m, n, ratio, max_rank=max_rank)
+    truc_s = S[:k]
+    truc_u = U[:, :k]
+    if g_blocks is not None:
+        for b in g_blocks:
+            s, e = b["start"], b["end"]
+            truc_u[s:e, :] = b["g_inv_sqrt"].matmul(truc_u[s:e, :])
+    elif g_inv_sqrt is not None:
+        truc_u = g_inv_sqrt.unsqueeze(1) * truc_u
+    if scaling_inv is not None:
+        truc_v = torch.matmul(VT[:k, :], scaling_inv)
+    else:
+        truc_v = VT[:k, :]
+    W_hat = torch.matmul(truc_u, torch.diag(truc_s).matmul(truc_v))
+    return W_hat, k
+
+
+def _loss_aware_candidate_ratios(args):
+    lo = max(1e-4, float(args.layer_ratio_min))
+    hi = min(0.9999, float(args.layer_ratio_max))
+    if args.loss_aware_ratio_candidates is not None:
+        vals = []
+        for token in str(args.loss_aware_ratio_candidates).split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                vals.append(min(hi, max(lo, float(token))))
+            except Exception:
+                pass
+        if vals:
+            vals.append(min(hi, max(lo, float(args.ratio))))
+            return sorted({round(v, 8) for v in vals})
+        print("[loss-aware] WARNING: --loss_aware_ratio_candidates parse failed, falling back to generated grid.")
+    n = max(3, int(args.loss_aware_num_candidates))
+    span = max(0.0, float(args.loss_aware_ratio_span))
+    center = min(hi, max(lo, float(args.ratio)))
+    if n == 1 or span <= 0:
+        return [center]
+    start = center - span
+    end = center + span
+    vals = []
+    for i in range(n):
+        t = i / max(n - 1, 1)
+        vals.append(min(hi, max(lo, start + (end - start) * t)))
+    vals.append(center)
+    return sorted({round(v, 8) for v in vals})
+
+
+def _solve_layerwise_mckp(layer_tables, budget_params, total_full, dp_bins=2000):
+    n_layers = len(layer_tables)
+    if n_layers == 0:
+        return [], 0.0
+    dp_bins = max(200, int(dp_bins))
+    bin_size = max(1, int(math.ceil(budget_params / dp_bins)))
+    budget_bin = max(1, int(budget_params // bin_size))
+
+    layer_bins = []
+    min_bin_sum = 0
+    max_bin_sum = 0
+    for table in layer_tables:
+        items = []
+        for ci, entry in enumerate(table):
+            cb = max(1, int(math.ceil(entry["cost"] / bin_size)))
+            items.append((ci, cb, float(entry["delta"])))
+        min_bin_sum += min(x[1] for x in items)
+        max_bin_sum += max(x[1] for x in items)
+        layer_bins.append(items)
+
+    if min_bin_sum > budget_bin:
+        chosen = [min(range(len(t)), key=lambda i: t[i]["cost"]) for t in layer_tables]
+        cost = sum(layer_tables[i][chosen[i]]["cost"] for i in range(n_layers))
+        return chosen, cost / max(total_full, 1)
+    if max_bin_sum < budget_bin:
+        chosen = [max(range(len(t)), key=lambda i: t[i]["cost"]) for t in layer_tables]
+        cost = sum(layer_tables[i][chosen[i]]["cost"] for i in range(n_layers))
+        return chosen, cost / max(total_full, 1)
+
+    inf = float("inf")
+    prev = [inf] * (budget_bin + 1)
+    prev[0] = 0.0
+    trace = []
+    for li in range(n_layers):
+        curr = [inf] * (budget_bin + 1)
+        back = [(-1, -1)] * (budget_bin + 1)
+        for bprev in range(budget_bin + 1):
+            if prev[bprev] == inf:
+                continue
+            base = prev[bprev]
+            for ci, cb, delta in layer_bins[li]:
+                b = bprev + cb
+                if b > budget_bin:
+                    continue
+                cand = base + delta
+                if cand < curr[b]:
+                    curr[b] = cand
+                    back[b] = (bprev, ci)
+        prev = curr
+        trace.append(back)
+
+    feasible = [b for b, v in enumerate(prev) if v < inf]
+    if not feasible:
+        chosen = [min(range(len(t)), key=lambda i: t[i]["cost"]) for t in layer_tables]
+        cost = sum(layer_tables[i][chosen[i]]["cost"] for i in range(n_layers))
+        return chosen, cost / max(total_full, 1)
+    best_b = min(feasible, key=lambda b: (prev[b], -b))
+
+    chosen = [0] * n_layers
+    b = best_b
+    for li in range(n_layers - 1, -1, -1):
+        bprev, ci = trace[li][b]
+        if bprev < 0 or ci < 0:
+            chosen[li] = min(range(len(layer_tables[li])), key=lambda i: layer_tables[li][i]["cost"])
+            b = max(b, 0)
+        else:
+            chosen[li] = ci
+            b = bprev
+    cost = sum(layer_tables[i][chosen[i]]["cost"] for i in range(n_layers))
+    return chosen, cost / max(total_full, 1)
+
+
+@torch.no_grad()
+def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, grad_diag=None, cali_white_data=None):
+    layers = _get_transformer_layers(args.model, model)
+    if layers is None:
+        return None
+
+    eval_nsamples = max(1, int(args.loss_aware_nsamples))
+    eval_seq_len = int(args.loss_aware_seq_len) if args.loss_aware_seq_len is not None else min(args.model_seq_len, 512)
+    eval_batch = max(1, int(args.loss_aware_batch_size))
+    eval_windows = eval_nsamples * eval_batch
+    can_reuse_white = (
+        cali_white_data is not None
+        and eval_seq_len == args.model_seq_len
+        and eval_batch == 1
+        and len(cali_white_data) >= eval_nsamples
+    )
+    if can_reuse_white:
+        eval_data = cali_white_data[:eval_nsamples]
+    else:
+        eval_data = get_calib_train_data(
+            args.dataset,
+            tokenizer,
+            eval_windows,
+            seqlen=eval_seq_len,
+            batch_size=eval_batch,
+        )
+    if len(eval_data) > eval_nsamples:
+        eval_data = eval_data[:eval_nsamples]
+
+    prev_device = next(iter(model.parameters())).device
+    model = model.to(args.DEV)
+    base_loss = _eval_calib_loss(model, eval_data, args.DEV)
+    print(f"[loss-aware] baseline calib loss={base_loss:.6f} using {len(eval_data)} batches (seq_len={eval_seq_len}, batch_size={eval_batch})")
+
+    candidates = _loss_aware_candidate_ratios(args)
+    print(f"[loss-aware] ratio candidates: {', '.join(f'{r:.4f}' for r in candidates)}")
+
+    layer_tables = []
+    layer_full_sizes = []
+    for li in tqdm(range(len(layers)), desc="loss-aware layers"):
+        layer = layers[li]
+        subset = find_layers(layer)
+        backups = {name: mod.weight.data.detach().cpu().clone() for name, mod in subset.items()}
+        layer_full = 0
+        for name, mod in subset.items():
+            m, n = mod.weight.shape
+            layer_full += int(m * n)
+        layer_full_sizes.append(layer_full)
+
+        table = []
+        for ratio_i in candidates:
+            cost_i = 0
+            for name, mod in subset.items():
+                scale = None
+                if profiling_mat is not None and li in profiling_mat and name in profiling_mat[li]:
+                    scale = profiling_mat[li][name]
+                g_entry = None
+                w_hat, rank_k = _low_rank_weight_from_ratio(
+                    mod,
+                    ratio=ratio_i,
+                    dev=args.DEV,
+                    scaling_diag_matrix=scale,
+                    grad_entry=g_entry,
+                    grad_eps=args.grad_eps,
+                    grad_inv_max=args.grad_inv_max,
+                    g_sigma_space=bool(getattr(args, "g_sigma_space", False)),
+                    g_blend_alpha=float(args.g_blend_alpha) if hasattr(args, "g_blend_alpha") and args.g_blend_alpha is not None else 1.0,
+                    max_rank=args.module_rank_max,
+                )
+                mod.weight.data.copy_(w_hat.to(mod.weight.device, dtype=mod.weight.dtype))
+                m, n = mod.weight.shape
+                cost_i += int(rank_k * (m + n))
+            loss_i = _eval_calib_loss(model, eval_data, args.DEV)
+            delta_i = loss_i - base_loss
+            table.append({
+                "ratio": float(ratio_i),
+                "cost": int(cost_i),
+                "loss": float(loss_i),
+                "delta": float(delta_i),
+            })
+            for name, mod in subset.items():
+                mod.weight.data.copy_(backups[name].to(mod.weight.device, dtype=mod.weight.dtype))
+        layer_tables.append(table)
+        if args.print_layer_ratios:
+            msg = "  ".join([f"r={x['ratio']:.4f}:Δ={x['delta']:+.5f}" for x in table])
+            print(f"[loss-aware] layer {li:02d} {msg}")
+
+    total_full = sum(layer_full_sizes)
+    target_params = args.ratio * total_full
+    chosen_idx, _ = _solve_layerwise_mckp(
+        layer_tables,
+        target_params,
+        total_full,
+        dp_bins=args.loss_aware_dp_bins,
+    )
+    chosen_ratios = [layer_tables[i][chosen_idx[i]]["ratio"] for i in range(len(layer_tables))]
+    chosen_cost = sum(layer_tables[i][chosen_idx[i]]["cost"] for i in range(len(layer_tables)))
+    chosen_delta = sum(layer_tables[i][chosen_idx[i]]["delta"] for i in range(len(layer_tables)))
+    print(f"[loss-aware] selected effective_ratio={chosen_cost/max(total_full,1):.6f} "
+          f"(target={args.ratio:.6f})  total_delta={chosen_delta:+.6f}")
+    if args.print_layer_ratios:
+        for li, ratio_i in enumerate(chosen_ratios):
+            info = layer_tables[li][chosen_idx[li]]
+            print(f"[loss-aware] layer {li:02d} ratio={ratio_i:.6f} "
+                  f"cost={info['cost']} delta={info['delta']:+.6f}")
+
+    if str(prev_device) == "cpu":
+        model = model.cpu()
+    return chosen_ratios
+
+
 def _obtain_module_ranks(args, model, profiling_mat, grad_diag):
     grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
     grad_seq_len = args.grad_seq_len if args.grad_seq_len is not None else args.model_seq_len
@@ -2071,9 +2434,7 @@ def _obtain_module_ranks(args, model, profiling_mat, grad_diag):
     # cache-load check and the save.  A fingerprint of 0 means G≈I (no real
     # gradient signal); a positive fingerprint means real gradient signal was
     # captured and would be wasted if a G≈I spectrum were loaded from cache.
-    grad_fingerprint = _grad_diag_fingerprint(
-        grad_diag if args.use_grad_g else None, args.grad_eps
-    )
+    grad_fingerprint = _grad_diag_fingerprint(None, args.grad_eps)
     print(f"[spectrum] grad_diag fingerprint={grad_fingerprint} "
           f"(0=G≈I/no-grad, >0=real gradient signal, units=log10 scale)")
     spectrum_path = args.spectrum_path
@@ -2089,7 +2450,7 @@ def _obtain_module_ranks(args, model, profiling_mat, grad_diag):
     if spectrum is None:
         spectrum = profile_module_spectrum(
             args.model, model, profiling_mat, args.DEV,
-            grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, grad_inv_max=args.grad_inv_max,
+            grad_diag=None, grad_eps=args.grad_eps, grad_inv_max=args.grad_inv_max,
             cascade_alpha=args.grad_cascade_alpha if hasattr(args, "grad_cascade_alpha") else 0.0,
             g_blend_alpha=args.g_blend_alpha if hasattr(args, "g_blend_alpha") and args.g_blend_alpha is not None else 1.0,
             g_sigma_space=bool(getattr(args, "g_sigma_space", False)),
@@ -2117,31 +2478,6 @@ def _obtain_module_ranks(args, model, profiling_mat, grad_diag):
     # blocks clamped to min_eig) the rank allocation can concentrate heavily
     # in a few late layers.  Warn unconditionally so the user sees the issue
     # even without --print_module_ranks.
-    if module_ranks is not None and args.use_grad_g:
-        _eff, _lstats = summarize_module_ranks(spectrum, module_ranks)
-        if _lstats:
-            _ratios = list(_lstats.values())
-            _min_r, _max_r = min(_ratios), max(_ratios)
-            if _max_r > 0 and _min_r >= 0:
-                _spread = _max_r / max(_min_r, 1e-9)
-                if _spread > 2.5 and _max_r > 1.5 * args.ratio:
-                    _n_at_floor = sum(1 for r in _ratios if r < args.ratio * 0.85)
-                    _n_above = sum(1 for r in _ratios if r > args.ratio * 1.5)
-                    print(
-                        f"[ranks] WARNING: rank distribution is highly concentrated.\n"
-                        f"  Layer ratios: min={_min_r:.3f}  target={args.ratio:.3f}  "
-                        f"max={_max_r:.3f}  (spread={_spread:.1f}x)\n"
-                        f"  {_n_at_floor} layer(s) near floor (<85% of target ratio), "
-                        f"{_n_above} layer(s) well above target (>150%).\n"
-                        f"  This pattern typically means gradient vanishing has left most "
-                        f"early layers clamped to min_eig in G, while 1-2 late layers drive "
-                        f"all the rank redistribution.  Early-layer compression errors then "
-                        f"cascade and raise PPL far above the uniform-allocation baseline.\n"
-                        f"  Recommended mitigations (choose one or combine):\n"
-                        f"    --layer_ratio_floor 0.38   # tighten floor to prevent over-squeeze\n"
-                        f"    --module_rank_min_qkv <N>  # protect attention projections\n"
-                        f"    --module_rank_min_mlp <N>  # protect MLP projections\n"
-                    )
     if args.print_module_ranks and module_ranks is not None:
         effective_ratio, layer_stats = summarize_module_ranks(spectrum, module_ranks)
         print(f"Module ranks (target={args.ratio:.6f}, effective={effective_ratio:.6f})")
@@ -2295,14 +2631,11 @@ if __name__ == '__main__':
     parser.add_argument('--updating_nsamples', type=int, default=16, help='Number of calibration data samples for udpating.')
     parser.add_argument('--save_path', type=str, default=None, help='the path to save the compressed model checkpoints.`')
     parser.add_argument('--profiling_mat_path', type=str, default=None, help='Local path to load the profiling matrices`')
-    parser.add_argument('--use_grad_g', action='store_true', help='whether to use output-gradient diag weighting')
     parser.add_argument('--grad_nsamples', type=int, default=None, help='Number of calibration batches for grad diag estimation')
     parser.add_argument('--grad_path', type=str, default=None, help='Local path to load grad diag (G) matrices')
-    parser.add_argument('--grad_eps', type=float, default=1e-6, help='Epsilon to avoid zero in grad diag')
     parser.add_argument('--grad_seq_len', type=int, default=None, help='Sequence length for grad diag profiling (defaults to model_seq_len)')
     parser.add_argument('--grad_batch_size', type=int, default=None, help='Batch size for grad diag profiling (defaults to 1)')
     parser.add_argument('--grad_checkpointing', action='store_true', help='Enable gradient checkpointing for grad diag profiling to reduce memory')
-    parser.add_argument('--g_block_diag', action='store_true', help='use block-diagonal G (head blocks + MLP groups)')
     parser.add_argument('--attn_block_size', type=int, default=0, help='attention block size (0 uses head_dim)')
     parser.add_argument('--mlp_block_size', type=int, default=256, help='MLP block size')
     parser.add_argument('--use_layerwise_ratio', action='store_true', help='allocate per-layer ratios based on G importance')
@@ -2310,6 +2643,22 @@ if __name__ == '__main__':
     parser.add_argument('--layer_ratio_max', type=float, default=0.99, help='Maximum per-layer keep ratio')
     parser.add_argument('--layer_ratio_strict', action='store_true', help='Rescale layer ratios to exactly match the global keep ratio')
     parser.add_argument('--print_layer_ratios', action='store_true', help='Print per-layer keep ratios and effective global ratio')
+    parser.add_argument('--use_loss_aware_layerwise', action='store_true',
+        help='Allocate one uniform keep ratio per layer by real calibration loss (NLL) + dynamic programming under global budget.')
+    parser.add_argument('--loss_aware_nsamples', type=int, default=8,
+        help='Number of calibration batches for loss-aware layerwise allocation.')
+    parser.add_argument('--loss_aware_seq_len', type=int, default=512,
+        help='Sequence length for loss-aware calibration (shorter is faster).')
+    parser.add_argument('--loss_aware_batch_size', type=int, default=1,
+        help='Batch size for loss-aware calibration.')
+    parser.add_argument('--loss_aware_num_candidates', type=int, default=5,
+        help='Number of keep-ratio candidates per layer when auto-generating the candidate grid.')
+    parser.add_argument('--loss_aware_ratio_span', type=float, default=0.08,
+        help='Candidate span around target keep ratio (target±span).')
+    parser.add_argument('--loss_aware_ratio_candidates', type=str, default=None,
+        help='Optional comma-separated keep-ratio candidates (after internal ratio conversion), e.g. "0.32,0.36,0.40,0.44,0.48".')
+    parser.add_argument('--loss_aware_dp_bins', type=int, default=2000,
+        help='DP budget bins for loss-aware layerwise allocation (larger = finer budget match, slower DP).')
     parser.add_argument('--use_module_rank_allocation', action='store_true', help='Allocate per-module ranks via spectrum + Lagrange')
     parser.add_argument('--spectrum_path', type=str, default=None, help='Path to load/save module spectrum cache')
     parser.add_argument('--module_rank_min', type=int, default=1, help='Minimum rank per module')
@@ -2323,28 +2672,6 @@ if __name__ == '__main__':
     parser.add_argument('--layer_ratio_floor', type=float, default=0.0, help='Minimum per-layer keep ratio when allocating module ranks')
     parser.add_argument('--module_rank_max', type=int, default=None, help='Maximum rank per module (default: min(out,in))')
     parser.add_argument('--print_module_ranks', action='store_true', help='Print per-module ranks and per-layer effective ratios')
-    parser.add_argument('--grad_inv_max', type=float, default=None, help='Clamp max value of g_inv_sqrt to avoid huge scaling')
-    parser.add_argument('--grad_cascade_alpha', type=float, default=0.0,
-        help='Cascade correction for first-order KFAC approximation. '
-             'Scales layer i G by (1 + alpha * i / (L-1)). Later layers get '
-             'higher G-weighting to compensate for KFAC ignoring sequential '
-             'forward error cascading (simultaneous compression of many layers). '
-             'Try 0.5-2.0 when G-weighted PPL is worse than uniform allocation. '
-             'Default 0.0 (no correction, pure KFAC).')
-    parser.add_argument('--g_blend_alpha', type=float, default=1.0,
-        help='Within-block G concentration reduction factor for spectrum computation. '
-             '1.0 = pure KFAC full block Cholesky (original behaviour). '
-             '0.0 = block-mean scalar only (replaces each block Cholesky with '
-             'sqrt(mean_eig(G_block))*I, eliminating within-block concentration). '
-             'Intermediate values blend the two: '
-             '  G_eff^{1/2}_block = alpha * Chol(G_block) + (1-alpha) * sqrt(mean_eig) * I. '
-             'For attention heads with G concentration ×Nc >> 1 (shown in grad_diag output), '
-             'the full Cholesky focuses the SVD budget on 1-2 hot principal directions per '
-             'block, leaving the remaining directions at min_eig.  This causes KFAC natural '
-             'rank to be much lower than the uniform allocation rank, making all modules '
-             'floor-bound and G-weighting ineffective. '
-             'Try 0.3-0.7 to reduce concentration while keeping cross-block variation. '
-             'Invalidates spectrum cache (recomputes spectrum for new alpha).  Default 1.0.')
     parser.add_argument('--g_cross_layer_norm', type=float, default=0.0,
         help='Cross-layer G normalization strength BETA (0.0=disabled, 1.0=full). '
              'Compresses the cross-layer G dynamic range by scaling each layer\'s G '
@@ -2358,14 +2685,6 @@ if __name__ == '__main__':
              'Invalidates grad_diag cache (rescales all G matrices). '
              'CRITICAL: also remove --layer_ratio_floor (or set to 0.0) so Lagrange '
              'has enough free budget to actually use the G signal.')
-    parser.add_argument('--g_center', action='store_true',
-        help='Centered second-moment G: subtract mean gradient direction μμᵀ from each G block. '
-             'Isolates input-dependent gradient variance from systematic batch drift. '
-             'G^c_j = (1/NT)Σ δy δyᵀ - μ_j μ_j^T  where μ_j = (1/NT)Σ δy^[j]. '
-             'Reports drift ratio (fraction of trace(G) removed) during profiling. '
-             'Effective when mean gradient is non-zero (e.g., language model loss has '
-             'a dominant softmax direction), filtering that bias from the covariance. '
-             'Compatible with --g_block_diag and --g_seq_level. Invalidates grad_diag cache.')
     parser.add_argument('--g_seq_level', action='store_true',
         help='Sequence-level gradient covariance G: aggregate gradients over the token '
              'dimension before computing the outer product. '
@@ -2378,19 +2697,6 @@ if __name__ == '__main__':
              'Especially relevant for autoregressive LLMs where adjacent token gradients are '
              'correlated through the causal mask. Compatible with --g_block_diag and --g_center. '
              'Invalidates grad_diag cache.')
-    parser.add_argument('--g_sigma_space', action='store_true',
-        help='Project block-diagonal G to the left-singular-vector basis of W before '
-             'applying the Cholesky factor (σ-space projection with off-diagonal coupling). '
-             'For each weight block W_j = U_j Σ_j Vh_j, the σ-space G is: '
-             'G^σ_j = U_j^T G_j U_j  (G expressed in the basis of W\'s left singular vectors). '
-             'The effective G^{1/2} applied to W is then: '
-             'W_scaled = Chol(G^σ_j) @ diag(Σ_j) @ Vh_j. '
-             'Off-diagonal elements of G^σ couple different singular modes so the final '
-             'svdvals(W_scaled @ H^{1/2}) reflect the true KFAC cost including cross-mode '
-             'interactions, rather than the Chol(G) rotation that may not align with σ-space. '
-             'Requires --g_block_diag; no-op for diagonal G modules. '
-             'Invalidates spectrum cache. '
-             'Incompatible with --g_blend_alpha < 1.0 (σ-space takes priority over blend).')
     parser.add_argument('--debug_svd', action='store_true', help='Print per-module truncation error and G stats for debugging')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
@@ -2401,11 +2707,17 @@ if __name__ == '__main__':
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
     
     args = parser.parse_args()
+    # Keep legacy internals stable while removing G-specific CLI knobs.
+    args.grad_eps = 1e-6
+    args.grad_inv_max = None
+    args.grad_cascade_alpha = 0.0
+    args.g_blend_alpha = 1.0
+    args.g_center = False
+    args.g_sigma_space = False
     args.ratio = 1- args.ratio
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
-        grad_diag = None
         layer_ratios = None
         module_ranks = None
         cali_white_data = None
@@ -2416,7 +2728,7 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        if args.use_grad_g or args.use_layerwise_ratio or args.use_module_rank_allocation:
+        if args.use_loss_aware_layerwise:
             # Convert to float32 before gradient profiling so that backward-pass
             # gradients do not underflow to zero in float16.  Step 2 already does
             # this (model = model.float() near the top of the step-2 branch).
@@ -2425,15 +2737,38 @@ if __name__ == '__main__':
             # small gradient values, making G ≈ epsilon * I and the gradient
             # weighting completely ineffective.
             model = model.float()
-            grad_diag = _obtain_grad_diag(args, model, tokenizer, cali_white_data)
-        if args.use_layerwise_ratio:
-            layer_ratios = _obtain_layer_ratios(args, model, grad_diag)
-        if args.use_module_rank_allocation:
-            module_ranks = _obtain_module_ranks(args, model, profiling_mat, grad_diag)
+        if args.use_loss_aware_layerwise:
+            if args.use_module_rank_allocation:
+                print("[loss-aware] --use_loss_aware_layerwise takes priority; --use_module_rank_allocation is ignored.")
+            layer_ratios = _obtain_loss_aware_layer_ratios(
+                args,
+                model,
+                tokenizer,
+                profiling_mat,
+                grad_diag=None,
+                cali_white_data=cali_white_data,
+            )
+            module_ranks = None
+        elif args.use_layerwise_ratio:
+            layer_ratios = _obtain_layer_ratios(args, model, None)
+        if args.use_module_rank_allocation and not args.use_loss_aware_layerwise:
+            module_ranks = _obtain_module_ranks(args, model, profiling_mat, None)
             layer_ratios = None
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max, debug_svd=args.debug_svd,
-                  g_sigma_space=bool(getattr(args, "g_sigma_space", False)),
-                  g_blend_alpha=float(args.g_blend_alpha) if hasattr(args, "g_blend_alpha") and args.g_blend_alpha is not None else 1.0)
+        whitening(
+            args.model,
+            model,
+            profiling_mat,
+            args.ratio,
+            args.DEV,
+            grad_diag=None,
+            grad_eps=1e-6,
+            layer_ratios=layer_ratios,
+            module_ranks=module_ranks,
+            grad_inv_max=None,
+            debug_svd=args.debug_svd,
+            g_sigma_space=False,
+            g_blend_alpha=1.0,
+        )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')
     elif args.step == 2:
@@ -2441,7 +2776,6 @@ if __name__ == '__main__':
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         model = model.eval()
         model = model.float()  # need to set to float
-        grad_diag = None
         layer_ratios = None
         module_ranks = None
         cali_white_data = None
@@ -2452,14 +2786,37 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        if args.use_grad_g or args.use_layerwise_ratio or args.use_module_rank_allocation:
-            grad_diag = _obtain_grad_diag(args, model, tokenizer, cali_white_data)
-        if args.use_layerwise_ratio:
-            layer_ratios = _obtain_layer_ratios(args, model, grad_diag)
-        if args.use_module_rank_allocation:
-            module_ranks = _obtain_module_ranks(args, model, profiling_mat, grad_diag)
+        if args.use_loss_aware_layerwise:
+            if args.use_module_rank_allocation:
+                print("[loss-aware] --use_loss_aware_layerwise takes priority; --use_module_rank_allocation is ignored.")
+            layer_ratios = _obtain_loss_aware_layer_ratios(
+                args,
+                model,
+                tokenizer,
+                profiling_mat,
+                grad_diag=None,
+                cali_white_data=cali_white_data,
+            )
+            module_ranks = None
+        elif args.use_layerwise_ratio:
+            layer_ratios = _obtain_layer_ratios(args, model, None)
+        if args.use_module_rank_allocation and not args.use_loss_aware_layerwise:
+            module_ranks = _obtain_module_ranks(args, model, profiling_mat, None)
             layer_ratios = None
-        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max, debug_svd=args.debug_svd)
+        whitening_local_update(
+            args.model,
+            model,
+            dataloader,
+            profiling_mat,
+            args.ratio,
+            args.DEV,
+            grad_diag=None,
+            grad_eps=1e-6,
+            layer_ratios=layer_ratios,
+            module_ranks=module_ranks,
+            grad_inv_max=None,
+            debug_svd=args.debug_svd,
+        )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')
     elif args.step == 3:
@@ -2467,17 +2824,40 @@ if __name__ == '__main__':
         model = model.eval()
         model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
-        grad_diag = None
         layer_ratios = None
         module_ranks = None
-        if args.use_grad_g or args.use_layerwise_ratio or args.use_module_rank_allocation:
-            grad_diag = _obtain_grad_diag(args, model, tokenizer)
-        if args.use_layerwise_ratio:
-            layer_ratios = _obtain_layer_ratios(args, model, grad_diag)
-        if args.use_module_rank_allocation:
-            module_ranks = _obtain_module_ranks(args, model, None, grad_diag)
+        if args.use_loss_aware_layerwise:
+            if args.use_module_rank_allocation:
+                print("[loss-aware] --use_loss_aware_layerwise takes priority; --use_module_rank_allocation is ignored.")
+            layer_ratios = _obtain_loss_aware_layer_ratios(
+                args,
+                model,
+                tokenizer,
+                profiling_mat=None,
+                grad_diag=None,
+                cali_white_data=None,
+            )
+            module_ranks = None
+        elif args.use_layerwise_ratio:
+            layer_ratios = _obtain_layer_ratios(args, model, None)
+        if args.use_module_rank_allocation and not args.use_loss_aware_layerwise:
+            module_ranks = _obtain_module_ranks(args, model, None, None)
             layer_ratios = None
-        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max, debug_svd=args.debug_svd)
+        whitening_local_update(
+            model_name=args.model,
+            model=model,
+            dataloader=dataloader,
+            profiling_mat=None,
+            ratio=args.ratio,
+            dev=args.DEV,
+            direct_update=True,
+            grad_diag=None,
+            grad_eps=1e-6,
+            layer_ratios=layer_ratios,
+            module_ranks=module_ranks,
+            grad_inv_max=None,
+            debug_svd=args.debug_svd,
+        )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')
     elif args.step >= 4:
