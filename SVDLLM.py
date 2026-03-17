@@ -810,8 +810,28 @@ def whitening(model_name, model, profiling_mat, ratio, dev, layer_ratios=None, m
 
 
 @torch.no_grad()
-def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, layer_ratios=None, module_ranks=None, debug_svd=False):
-    print("Start SVD decomposition then update...")
+def whitening_local_update(
+    model_name,
+    model,
+    dataloader,
+    profiling_mat,
+    ratio,
+    dev,
+    direct_update=False,
+    layer_ratios=None,
+    module_ranks=None,
+    debug_svd=False,
+    use_bi_closed_form=True,
+    use_weighted_update=True,
+    bi_weight_mode="residual",
+    bi_weight_alpha=0.5,
+    bi_weight_clip=10.0,
+    bi_u_ridge=1e-5,
+    bi_v_ridge=1e-5,
+    bi_sigma_eps=1e-6,
+):
+    print("Start SVD decomposition then update "
+          f"(bi_closed_form={use_bi_closed_form}, weighted={use_weighted_update}, weight_mode={bi_weight_mode})...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
     if "opt" in model_name:
@@ -896,6 +916,14 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                 direct_update=direct_update,
                 rank=rank_override,
                 debug_svd=debug_svd,
+                use_bi_closed_form=use_bi_closed_form,
+                use_weighted_update=use_weighted_update,
+                bi_weight_mode=bi_weight_mode,
+                bi_weight_alpha=bi_weight_alpha,
+                bi_weight_clip=bi_weight_clip,
+                bi_u_ridge=bi_u_ridge,
+                bi_v_ridge=bi_v_ridge,
+                bi_sigma_eps=bi_sigma_eps,
             )
         
         def add_batch(name):
@@ -984,10 +1012,36 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
 
 
 class local_update:
-    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False, rank=None, debug_svd=False):
+    def __init__(
+        self,
+        layer,
+        scaling_diag_matrix,
+        ratio,
+        name,
+        direct_update=False,
+        rank=None,
+        debug_svd=False,
+        use_bi_closed_form=True,
+        use_weighted_update=True,
+        bi_weight_mode="residual",
+        bi_weight_alpha=0.5,
+        bi_weight_clip=10.0,
+        bi_u_ridge=1e-5,
+        bi_v_ridge=1e-5,
+        bi_sigma_eps=1e-6,
+    ):
         self.layer = layer
         self.name = name
         self.dev = self.layer.weight.device
+        self.debug_svd = debug_svd
+        self.use_bi_closed_form = bool(use_bi_closed_form)
+        self.use_weighted_update = bool(use_weighted_update)
+        self.bi_weight_mode = str(bi_weight_mode)
+        self.bi_weight_alpha = float(bi_weight_alpha)
+        self.bi_weight_clip = float(bi_weight_clip)
+        self.bi_u_ridge = float(bi_u_ridge)
+        self.bi_v_ridge = float(bi_v_ridge)
+        self.bi_sigma_eps = float(bi_sigma_eps)
         W = layer.weight.data.clone()
         self.rows = W.shape[0]
         self.columns = W.shape[1]
@@ -1010,6 +1064,7 @@ class local_update:
         else:
             num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
         num_s_after_trunc = max(1, min(num_s_after_trunc, min(W.shape[0], W.shape[1])))
+        self.rank = num_s_after_trunc
         if debug_svd:
             s2 = (self.S.float() ** 2)
             denom = float(s2.sum().item())
@@ -1029,25 +1084,110 @@ class local_update:
         self.new_w = torch.matmul(self.truc_u, torch.matmul(self.truc_sigma, self.truc_v[:num_s_after_trunc, :]))
         # intialize H for close form solution
         self.updated_err = self.error = 0
+        # One-shot initialization: if hooks are skipped, fallback to truncated factors.
+        self.updated_uT = self.truc_u.t().clone()
+        self.updated_truc_v = self.truc_v.clone()
+
+    def _solve_weighted_ridge(self, X, Y, weights=None, ridge=0.0, prior=None):
+        if weights is not None:
+            sw = torch.sqrt(weights).unsqueeze(1)
+            Xw = X * sw
+            Yw = Y * sw
+        else:
+            Xw = X
+            Yw = Y
+        lhs = Xw.t().matmul(Xw)
+        rhs = Xw.t().matmul(Yw)
+        if ridge > 0:
+            eye = torch.eye(lhs.shape[0], device=lhs.device, dtype=lhs.dtype)
+            lhs = lhs + ridge * eye
+            if prior is not None:
+                rhs = rhs + ridge * prior
+        try:
+            sol = torch.linalg.solve(lhs, rhs)
+        except Exception:
+            sol = torch.linalg.lstsq(lhs, rhs).solution
+        return sol
+
+    def _compute_sample_weights(self, outs, base_output, eps=1e-12):
+        if (not self.use_weighted_update) or self.bi_weight_mode == "uniform":
+            return None
+        mode = self.bi_weight_mode
+        if mode == "output_norm":
+            base = outs.pow(2).mean(dim=1)
+        else:
+            # Default residual-based weighting: prioritize hard tokens.
+            base = (outs - base_output).pow(2).mean(dim=1)
+        alpha = max(0.0, self.bi_weight_alpha)
+        weights = (base + eps).pow(alpha)
+        mean_w = float(weights.mean().item())
+        if mean_w > 0:
+            weights = weights / mean_w
+        clip = max(1.0, self.bi_weight_clip)
+        weights = torch.clamp(weights, min=1.0 / clip, max=clip)
+        return weights
 
     def add_batch_update_u(self, inp, out):
-        inps = inp.view(inp.shape[0] * inp.shape[1], inp.shape[2])
-        outs = out.view(out.shape[0] * out.shape[1], out.shape[2])
-        new_w = torch.matmul(self.truc_u, torch.matmul(self.truc_sigma, self.truc_v))
-        new_output = inps.matmul(new_w.t())
-        self.error = torch.sqrt(torch.sum((outs - new_output)**2)).item() / torch.norm(outs, p='fro').item()
-        x = torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma)
-        self.updated_uT = torch.linalg.lstsq(x, outs).solution
-        updated_output = torch.matmul(torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma), self.updated_uT)
-        self.updated_error = torch.sqrt(torch.sum((outs - updated_output)**2)).item() / torch.norm(outs, p='fro').item()
-        inps = outs = new_output = updated_output = x = new_w = None
-        del inps, outs, new_output, updated_output, x, new_w
+        inps = inp.view(inp.shape[0] * inp.shape[1], inp.shape[2]).float()
+        outs = out.view(out.shape[0] * out.shape[1], out.shape[2]).float()
+        # Rank-space feature used by both U-step and V-step.
+        x_latent = torch.matmul(torch.matmul(inps, self.truc_v.t()), self.truc_sigma)  # [N, r]
+        base_output = torch.matmul(x_latent, self.truc_u.t())  # [N, d_out]
+        out_norm = torch.norm(outs, p="fro").clamp_min(1e-12)
+        self.error = torch.sqrt(torch.sum((outs - base_output) ** 2)).item() / out_norm.item()
+
+        weights = self._compute_sample_weights(outs, base_output)
+
+        # Step 1: fixed V, solve U in closed form (weighted ridge LS).
+        u_prior = self.truc_u.t()
+        self.updated_uT = self._solve_weighted_ridge(
+            x_latent,
+            outs,
+            weights=weights,
+            ridge=self.bi_u_ridge,
+            prior=u_prior,
+        )
+
+        # Step 2: fixed U, solve right factor one-shot in rank space.
+        if self.use_bi_closed_form:
+            u_mat = self.updated_uT.t()                     # [d_out, r]
+            target_latent = torch.matmul(outs, u_mat)      # [N, r]
+            r_prior = torch.eye(self.rank, device=self.dev, dtype=x_latent.dtype)
+            r_corr = self._solve_weighted_ridge(
+                x_latent,
+                target_latent,
+                weights=weights,
+                ridge=self.bi_v_ridge,
+                prior=r_prior,
+            )  # [r, r]
+            sigma = self.truc_sigma
+            sigma_inv = torch.diag(1.0 / torch.clamp(self.truc_s, min=self.bi_sigma_eps))
+            # Enforce x_new = x_latent @ r_corr via V update:
+            # V_new^T = V^T Σ R Σ^{-1}  =>  V_new = Σ^{-1} R^T Σ V.
+            self.updated_truc_v = sigma_inv.matmul(r_corr.t().matmul(sigma.matmul(self.truc_v)))
+        else:
+            self.updated_truc_v = self.truc_v
+
+        updated_latent = torch.matmul(torch.matmul(inps, self.updated_truc_v.t()), self.truc_sigma)
+        updated_output = torch.matmul(updated_latent, self.updated_uT)
+        self.updated_error = torch.sqrt(torch.sum((outs - updated_output) ** 2)).item() / out_norm.item()
+        if self.debug_svd:
+            if weights is None:
+                print(f"[debug] {self.name} one-shot: rel_err {self.error:.6f} -> {self.updated_error:.6f}")
+            else:
+                wmin = float(weights.min().item())
+                wmax = float(weights.max().item())
+                print(f"[debug] {self.name} one-shot: rel_err {self.error:.6f} -> {self.updated_error:.6f}  "
+                      f"weights[{wmin:.3f},{wmax:.3f}]")
+
+        inps = outs = x_latent = base_output = updated_latent = updated_output = None
+        del inps, outs, x_latent, base_output, updated_latent, updated_output
         torch.cuda.empty_cache()
     
     def fasterprune(self):
         sqrtSigma = torch.sqrt(self.truc_sigma)
         self.appendU = self.updated_uT.t().matmul(sqrtSigma)
-        self.appendV = sqrtSigma.matmul(self.truc_v)
+        self.appendV = sqrtSigma.matmul(self.updated_truc_v)
         return self.appendU, self.appendV
 
 
@@ -1575,6 +1715,22 @@ if __name__ == '__main__':
     parser.add_argument('--layer_ratio_floor', type=float, default=0.0, help='Minimum per-layer keep ratio when allocating module ranks')
     parser.add_argument('--module_rank_max', type=int, default=None, help='Maximum rank per module (default: min(out,in))')
     parser.add_argument('--print_module_ranks', action='store_true', help='Print per-module ranks and per-layer effective ratios')
+    parser.add_argument('--disable_bi_closed_form', action='store_true',
+        help='Disable one-shot bi-side correction and use U-only closed-form update.')
+    parser.add_argument('--disable_weighted_update', action='store_true',
+        help='Disable weighted update and use uniform token weights in local correction.')
+    parser.add_argument('--bi_weight_mode', type=str, default='residual', choices=['residual', 'output_norm', 'uniform'],
+        help='Sample weighting mode for one-shot correction.')
+    parser.add_argument('--bi_weight_alpha', type=float, default=0.5,
+        help='Power for sample weighting (w=(signal+eps)^alpha).')
+    parser.add_argument('--bi_weight_clip', type=float, default=10.0,
+        help='Clip range for normalized sample weights [1/clip, clip].')
+    parser.add_argument('--bi_u_ridge', type=float, default=1e-5,
+        help='Ridge coefficient for U-step closed-form solve.')
+    parser.add_argument('--bi_v_ridge', type=float, default=1e-5,
+        help='Ridge coefficient for V-step closed-form solve.')
+    parser.add_argument('--bi_sigma_eps', type=float, default=1e-6,
+        help='Numerical epsilon for inverting singular values in bi-side V-step.')
     parser.add_argument('--debug_svd', action='store_true', help='Print per-module truncation error and G stats for debugging')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
@@ -1665,6 +1821,8 @@ if __name__ == '__main__':
         if args.use_module_rank_allocation and not args.use_loss_aware_layerwise:
             module_ranks = _obtain_module_ranks(args, model, profiling_mat)
             layer_ratios = None
+        if args.use_loss_aware_layerwise:
+            print("[method] Loss-aware rank allocation + weighted one-shot bi-side closed-form correction")
         whitening_local_update(
             args.model,
             model,
@@ -1675,6 +1833,14 @@ if __name__ == '__main__':
             layer_ratios=layer_ratios,
             module_ranks=module_ranks,
             debug_svd=args.debug_svd,
+            use_bi_closed_form=not args.disable_bi_closed_form,
+            use_weighted_update=not args.disable_weighted_update,
+            bi_weight_mode=args.bi_weight_mode,
+            bi_weight_alpha=args.bi_weight_alpha,
+            bi_weight_clip=args.bi_weight_clip,
+            bi_u_ridge=args.bi_u_ridge,
+            bi_v_ridge=args.bi_v_ridge,
+            bi_sigma_eps=args.bi_sigma_eps,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')
@@ -1701,6 +1867,8 @@ if __name__ == '__main__':
         if args.use_module_rank_allocation and not args.use_loss_aware_layerwise:
             module_ranks = _obtain_module_ranks(args, model, None)
             layer_ratios = None
+        if args.use_loss_aware_layerwise:
+            print("[method] Loss-aware rank allocation + weighted one-shot bi-side closed-form correction")
         whitening_local_update(
             model_name=args.model,
             model=model,
@@ -1712,6 +1880,14 @@ if __name__ == '__main__':
             layer_ratios=layer_ratios,
             module_ranks=module_ranks,
             debug_svd=args.debug_svd,
+            use_bi_closed_form=not args.disable_bi_closed_form,
+            use_weighted_update=not args.disable_weighted_update,
+            bi_weight_mode=args.bi_weight_mode,
+            bi_weight_alpha=args.bi_weight_alpha,
+            bi_weight_clip=args.bi_weight_clip,
+            bi_u_ridge=args.bi_u_ridge,
+            bi_v_ridge=args.bi_v_ridge,
+            bi_sigma_eps=args.bi_sigma_eps,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')
