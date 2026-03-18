@@ -682,6 +682,34 @@ def _print_layer_compression_stats(prefix, layer_id, full_params, low_params, co
     )
 
 
+def _module_rank_type(name):
+    if any(t in name for t in ("q_proj", "k_proj", "v_proj")):
+        return "qkv"
+    if any(t in name for t in ("o_proj", "out_proj")):
+        return "o"
+    if "down_proj" in name:
+        return "down"
+    if any(t in name for t in ("gate_proj", "up_proj")):
+        return "mlp"
+    return "other"
+
+
+def _print_layer_rank_detail(layer_id, rank_map):
+    groups = {"qkv": [], "o": [], "mlp": [], "down": [], "other": []}
+    for name, k in rank_map.items():
+        groups[_module_rank_type(name)].append(int(k))
+    parts = []
+    for key in ("qkv", "o", "mlp", "down", "other"):
+        vals = groups[key]
+        if not vals:
+            continue
+        vmin, vmax = min(vals), max(vals)
+        vmean = sum(vals) / len(vals)
+        parts.append(f"{key}={vmin}/{vmean:.1f}/{vmax}")
+    if parts:
+        print(f"[layer-ranks] layer {layer_id:02d}: " + "  ".join(parts))
+
+
 def _spectrum_meta(args):
     return {
         "model": args.model,
@@ -705,7 +733,17 @@ def _load_spectrum(path, expected_meta=None):
      
  
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev, layer_ratios=None, module_ranks=None, debug_svd=False):
+def whitening(
+    model_name,
+    model,
+    profiling_mat,
+    ratio,
+    dev,
+    layer_ratios=None,
+    module_ranks=None,
+    debug_svd=False,
+    print_layer_rank_detail=False,
+):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
@@ -725,6 +763,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev, layer_ratios=None, m
         layer_low_params = 0
         layer_cost_sum = 0
         layer_rank_values = []
+        layer_rank_map = {}
         #### Replace Attn, MLP ####
         if "llama" in model_name or "vicuna" in model_name:
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
@@ -760,6 +799,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev, layer_ratios=None, m
             layer_low_params += num_s_after_trunc * (m + n)
             layer_cost_sum += (m + n)
             layer_rank_values.append(int(num_s_after_trunc))
+            layer_rank_map[name] = int(num_s_after_trunc)
             if debug_svd:
                 s2 = (S.float() ** 2)
                 denom = float(s2.sum().item())
@@ -842,6 +882,8 @@ def whitening(model_name, model, profiling_mat, ratio, dev, layer_ratios=None, m
             layer_cost_sum,
             layer_rank_values,
         )
+        if print_layer_rank_detail:
+            _print_layer_rank_detail(i, layer_rank_map)
         global_full_params += layer_full_params
         global_low_params += layer_low_params
         global_cost_sum += layer_cost_sum
@@ -877,6 +919,7 @@ def whitening_local_update(
     bi_u_ridge=1e-5,
     bi_v_ridge=1e-5,
     bi_sigma_eps=1e-6,
+    print_layer_rank_detail=False,
 ):
     print("Start SVD decomposition then update "
           f"(bi_closed_form={use_bi_closed_form}, weighted={use_weighted_update}, weight_mode={bi_weight_mode})...")
@@ -948,6 +991,7 @@ def whitening_local_update(
         layer_low_params = 0
         layer_cost_sum = 0
         layer_rank_values = []
+        layer_rank_map = {}
         if "llama" in model_name or "vicuna" in model_name:
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, ranks=mlp_ranks if mlp_ranks else None)
@@ -986,6 +1030,7 @@ def whitening_local_update(
             layer_low_params += rk * (m + n)
             layer_cost_sum += (m + n)
             layer_rank_values.append(rk)
+            layer_rank_map[name] = rk
         
         def add_batch(name):
             def tmp(_, inp, out):
@@ -1066,6 +1111,8 @@ def whitening_local_update(
             layer_cost_sum,
             layer_rank_values,
         )
+        if print_layer_rank_detail:
+            _print_layer_rank_detail(i, layer_rank_map)
         global_full_params += layer_full_params
         global_low_params += layer_low_params
         global_cost_sum += layer_cost_sum
@@ -1378,6 +1425,8 @@ def _loss_aware_candidate_ratios(args):
             except Exception:
                 pass
         if vals:
+            if args.loss_aware_include_bounds:
+                vals.extend([lo, hi])
             vals.append(min(hi, max(lo, float(args.ratio))))
             return sorted({round(v, 8) for v in vals})
         print("[loss-aware] WARNING: --loss_aware_ratio_candidates parse failed, falling back to generated grid.")
@@ -1510,30 +1559,64 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
     for li in tqdm(range(len(layers)), desc="loss-aware layers"):
         layer = layers[li]
         subset = find_layers(layer)
-        backups = {name: mod.weight.data.detach().cpu().clone() for name, mod in subset.items()}
+        profiling_layer = profiling_mat[li] if (profiling_mat is not None and li in profiling_mat) else None
+        # Build per-module low-rank caches once for this layer. Candidate sweeps then
+        # only change the truncation rank k, avoiding repeated full SVD/inversion.
+        layer_cache = {}
         layer_full = 0
         for name, mod in subset.items():
             m, n = mod.weight.shape
             layer_full += int(m * n)
+            k_cap = max(_rank_from_ratio(int(m), int(n), r, max_rank=args.module_rank_max) for r in candidates)
+            k_cap = max(1, min(k_cap, min(int(m), int(n))))
+
+            scale = profiling_layer[name] if (profiling_layer is not None and name in profiling_layer) else None
+            W = mod.weight.data.detach().float().to(args.DEV)
+            if scale is not None:
+                scale = scale.to(args.DEV).float()
+                try:
+                    scale_inv = torch.linalg.inv(scale)
+                except Exception:
+                    scale = scale + 1e-6 * torch.eye(scale.shape[0], device=args.DEV, dtype=scale.dtype)
+                    scale_inv = torch.linalg.inv(scale)
+                W_scale = torch.matmul(W, scale)
+            else:
+                scale_inv = None
+                W_scale = W
+
+            U_full, S_full, VT_full = torch.linalg.svd(W_scale, full_matrices=False)
+            U = U_full[:, :k_cap].contiguous()
+            S = S_full[:k_cap].contiguous()
+            if scale_inv is not None:
+                V = torch.matmul(VT_full[:k_cap, :], scale_inv).contiguous()
+            else:
+                V = VT_full[:k_cap, :].contiguous()
+            layer_cache[name] = {
+                "backup": mod.weight.data.detach().clone(),
+                "m": int(m),
+                "n": int(n),
+                "k_cap": int(k_cap),
+                "U": U,
+                "S": S,
+                "V": V,
+            }
+            W = W_scale = scale = scale_inv = U_full = S_full = VT_full = None
+            del W, W_scale, scale, scale_inv, U_full, S_full, VT_full
         layer_full_sizes.append(layer_full)
 
         table = []
         for ratio_i in candidates:
             cost_i = 0
             for name, mod in subset.items():
-                scale = None
-                if profiling_mat is not None and li in profiling_mat and name in profiling_mat[li]:
-                    scale = profiling_mat[li][name]
-                w_hat, rank_k = _low_rank_weight_from_ratio(
-                    mod,
-                    ratio=ratio_i,
-                    dev=args.DEV,
-                    scaling_diag_matrix=scale,
-                    max_rank=args.module_rank_max,
-                )
+                info = layer_cache[name]
+                rank_k = _rank_from_ratio(info["m"], info["n"], ratio_i, max_rank=args.module_rank_max)
+                rank_k = max(1, min(rank_k, info["k_cap"]))
+                U = info["U"][:, :rank_k]
+                S = info["S"][:rank_k]
+                V = info["V"][:rank_k, :]
+                w_hat = torch.matmul(U * S.unsqueeze(0), V)
                 mod.weight.data.copy_(w_hat.to(mod.weight.device, dtype=mod.weight.dtype))
-                m, n = mod.weight.shape
-                cost_i += int(rank_k * (m + n))
+                cost_i += int(rank_k * (info["m"] + info["n"]))
             loss_i = _eval_calib_loss(model, eval_data, args.DEV)
             delta_i = loss_i - base_loss
             table.append({
@@ -1542,8 +1625,9 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                 "loss": float(loss_i),
                 "delta": float(delta_i),
             })
-            for name, mod in subset.items():
-                mod.weight.data.copy_(backups[name].to(mod.weight.device, dtype=mod.weight.dtype))
+        for name, mod in subset.items():
+            mod.weight.data.copy_(layer_cache[name]["backup"].to(mod.weight.device, dtype=mod.weight.dtype))
+        layer_cache.clear()
         layer_tables.append(table)
         if args.print_layer_ratios:
             msg = "  ".join([f"r={x['ratio']:.4f}:Δ={x['delta']:+.5f}" for x in table])
@@ -1780,6 +1864,8 @@ if __name__ == '__main__':
         help='Candidate span around target keep ratio (target±span).')
     parser.add_argument('--loss_aware_ratio_candidates', type=str, default=None,
         help='Optional comma-separated keep-ratio candidates (after internal ratio conversion), e.g. "0.32,0.36,0.40,0.44,0.48".')
+    parser.add_argument('--loss_aware_include_bounds', action='store_true',
+        help='When custom loss-aware candidates are provided, also include layer_ratio_min/max to keep allocator freedom.')
     parser.add_argument('--loss_aware_dp_bins', type=int, default=2000,
         help='DP budget bins for loss-aware layerwise allocation (larger = finer budget match, slower DP).')
     parser.add_argument('--use_module_rank_allocation', action='store_true', help='Allocate per-module ranks via spectrum + Lagrange')
@@ -1795,6 +1881,8 @@ if __name__ == '__main__':
     parser.add_argument('--layer_ratio_floor', type=float, default=0.0, help='Minimum per-layer keep ratio when allocating module ranks')
     parser.add_argument('--module_rank_max', type=int, default=None, help='Maximum rank per module (default: min(out,in))')
     parser.add_argument('--print_module_ranks', action='store_true', help='Print per-module ranks and per-layer effective ratios')
+    parser.add_argument('--print_layer_rank_detail', action='store_true',
+        help='Print per-layer rank detail by module type (qkv/o/mlp/down).')
     parser.add_argument('--disable_bi_closed_form', action='store_true',
         help='Disable one-shot bi-side correction and use U-only closed-form update.')
     parser.add_argument('--disable_weighted_update', action='store_true',
@@ -1860,6 +1948,7 @@ if __name__ == '__main__':
             layer_ratios=layer_ratios,
             module_ranks=module_ranks,
             debug_svd=args.debug_svd,
+            print_layer_rank_detail=args.print_layer_rank_detail,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')
@@ -1914,6 +2003,7 @@ if __name__ == '__main__':
             bi_u_ridge=args.bi_u_ridge,
             bi_v_ridge=args.bi_v_ridge,
             bi_sigma_eps=args.bi_sigma_eps,
+            print_layer_rank_detail=args.print_layer_rank_detail,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')
@@ -1961,6 +2051,7 @@ if __name__ == '__main__':
             bi_u_ridge=args.bi_u_ridge,
             bi_v_ridge=args.bi_v_ridge,
             bi_sigma_eps=args.bi_sigma_eps,
+            print_layer_rank_detail=args.print_layer_rank_detail,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')
