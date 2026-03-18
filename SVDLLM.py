@@ -665,6 +665,23 @@ def _save_model_fp16(model, tokenizer, path):
     model = model.to(prev_dtype)
 
 
+def _print_layer_compression_stats(prefix, layer_id, full_params, low_params, cost_sum, rank_values):
+    if full_params <= 0 or cost_sum <= 0:
+        return
+    keep_ratio = low_params / full_params
+    compress_ratio = 1.0 - keep_ratio
+    effective_rank = low_params / cost_sum
+    rmin = min(rank_values) if rank_values else 0
+    rmax = max(rank_values) if rank_values else 0
+    rmean = (sum(rank_values) / len(rank_values)) if rank_values else 0.0
+    print(
+        f"[{prefix}] layer {layer_id:02d}: "
+        f"keep={keep_ratio:.4f} compress={compress_ratio:.4f} "
+        f"effective_rank={effective_rank:.2f} "
+        f"rank[min/mean/max]={rmin}/{rmean:.1f}/{rmax}"
+    )
+
+
 def _spectrum_meta(args):
     return {
         "model": args.model,
@@ -695,12 +712,19 @@ def whitening(model_name, model, profiling_mat, ratio, dev, layer_ratios=None, m
     else:
         layers = model.model.layers
     print("Start SVD decomposition after whitening...")
+    global_full_params = 0
+    global_low_params = 0
+    global_cost_sum = 0
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         ratio_i = layer_ratios[i] if layer_ratios is not None else ratio
         ranks_layer = module_ranks[i] if module_ranks is not None and i in module_ranks else None
         attn_ranks, mlp_ranks = _split_module_ranks(ranks_layer)
         subset = find_layers(layer)
+        layer_full_params = 0
+        layer_low_params = 0
+        layer_cost_sum = 0
+        layer_rank_values = []
         #### Replace Attn, MLP ####
         if "llama" in model_name or "vicuna" in model_name:
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
@@ -731,6 +755,11 @@ def whitening(model_name, model, profiling_mat, ratio, dev, layer_ratios=None, m
             else:
                 num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio_i / (W.shape[0] + W.shape[1]))
             num_s_after_trunc = max(1, min(num_s_after_trunc, min(W.shape[0], W.shape[1])))
+            m, n = int(W.shape[0]), int(W.shape[1])
+            layer_full_params += m * n
+            layer_low_params += num_s_after_trunc * (m + n)
+            layer_cost_sum += (m + n)
+            layer_rank_values.append(int(num_s_after_trunc))
             if debug_svd:
                 s2 = (S.float() ** 2)
                 denom = float(s2.sum().item())
@@ -805,8 +834,27 @@ def whitening(model_name, model, profiling_mat, ratio, dev, layer_ratios=None, m
         else:
             layer.self_attn = svd_attn
             layer.mlp = svd_mlp
+        _print_layer_compression_stats(
+            "layer-stats",
+            i,
+            layer_full_params,
+            layer_low_params,
+            layer_cost_sum,
+            layer_rank_values,
+        )
+        global_full_params += layer_full_params
+        global_low_params += layer_low_params
+        global_cost_sum += layer_cost_sum
         del layer
         torch.cuda.empty_cache()
+    if global_full_params > 0 and global_cost_sum > 0:
+        keep_ratio = global_low_params / global_full_params
+        compress_ratio = 1.0 - keep_ratio
+        effective_rank = global_low_params / global_cost_sum
+        print(
+            f"[layer-stats] overall: keep={keep_ratio:.4f} compress={compress_ratio:.4f} "
+            f"effective_rank={effective_rank:.2f}"
+        )
 
 
 @torch.no_grad()
@@ -886,6 +934,9 @@ def whitening_local_update(
     attention_masks = cache['attention_mask']
     if "opt" not in model_name:
         position_ids = cache['position_ids']
+    global_full_params = 0
+    global_low_params = 0
+    global_cost_sum = 0
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
         ratio_i = layer_ratios[i] if layer_ratios is not None else ratio
@@ -893,6 +944,10 @@ def whitening_local_update(
         attn_ranks, mlp_ranks = _split_module_ranks(ranks_layer)
         subset = find_layers(layer)
         gpts = {}
+        layer_full_params = 0
+        layer_low_params = 0
+        layer_cost_sum = 0
+        layer_rank_values = []
         if "llama" in model_name or "vicuna" in model_name:
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, ranks=mlp_ranks if mlp_ranks else None)
@@ -925,6 +980,12 @@ def whitening_local_update(
                 bi_v_ridge=bi_v_ridge,
                 bi_sigma_eps=bi_sigma_eps,
             )
+            m, n = int(subset[name].weight.shape[0]), int(subset[name].weight.shape[1])
+            rk = int(gpts[name].rank)
+            layer_full_params += m * n
+            layer_low_params += rk * (m + n)
+            layer_cost_sum += (m + n)
+            layer_rank_values.append(rk)
         
         def add_batch(name):
             def tmp(_, inp, out):
@@ -997,6 +1058,17 @@ def whitening_local_update(
         else:
             layer.self_attn = svd_attn
             layer.mlp = svd_mlp
+        _print_layer_compression_stats(
+            "layer-stats",
+            i,
+            layer_full_params,
+            layer_low_params,
+            layer_cost_sum,
+            layer_rank_values,
+        )
+        global_full_params += layer_full_params
+        global_low_params += layer_low_params
+        global_cost_sum += layer_cost_sum
         layer = layer.to(dev)
         if "opt" not in model_name:
             outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
@@ -1009,6 +1081,14 @@ def whitening_local_update(
         outs = None
         del outs
     model.config.use_cache = use_cache
+    if global_full_params > 0 and global_cost_sum > 0:
+        keep_ratio = global_low_params / global_full_params
+        compress_ratio = 1.0 - keep_ratio
+        effective_rank = global_low_params / global_cost_sum
+        print(
+            f"[layer-stats] overall: keep={keep_ratio:.4f} compress={compress_ratio:.4f} "
+            f"effective_rank={effective_rank:.2f}"
+        )
 
 
 class local_update:
