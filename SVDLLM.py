@@ -1836,13 +1836,6 @@ if __name__ == '__main__':
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
         if args.use_loss_aware_layerwise:
-            # Convert to float32 before gradient profiling so that backward-pass
-            # gradients do not underflow to zero in float16.  Step 2 already does
-            # this (model = model.float() near the top of the step-2 branch).
-            # Without this, tiny gradient values can underflow and hurt
-            # layerwise allocation quality.
-            model = model.float()
-        if args.use_loss_aware_layerwise:
             if args.use_module_rank_allocation:
                 print("[loss-aware] --use_loss_aware_layerwise takes priority; --use_module_rank_allocation is ignored.")
             layer_ratios = _obtain_loss_aware_layer_ratios(
