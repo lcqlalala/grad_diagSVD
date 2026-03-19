@@ -4,6 +4,7 @@ import sys
 import argparse
 import heapq
 import math
+from contextlib import nullcontext
 import torch.jit
 from tqdm import tqdm
 import torch
@@ -1342,11 +1343,14 @@ def _get_transformer_layers(model_name, model):
 
 
 @torch.no_grad()
-def _eval_calib_loss(model, calib_data, dev, max_batches=None):
+def _eval_calib_loss(model, calib_data, dev, max_batches=None, use_autocast_bf16=False):
     prev_use_cache = getattr(model.config, "use_cache", None)
     if prev_use_cache is not None:
         model.config.use_cache = False
     model.eval()
+    dev_str = str(dev)
+    device_type = dev.type if isinstance(dev, torch.device) else dev_str.split(":")[0]
+    enable_autocast = bool(use_autocast_bf16 and device_type == "cuda" and torch.cuda.is_available())
     total_loss = 0.0
     total_tokens = 0
     for bi, batch in enumerate(calib_data):
@@ -1354,13 +1358,15 @@ def _eval_calib_loss(model, calib_data, dev, max_batches=None):
             break
         batch = {k: v.to(dev) for k, v in batch.items()}
         labels = batch["input_ids"]
-        outputs = model(
-            **batch,
-            labels=labels,
-            use_cache=False,
-            output_attentions=False,
-            output_hidden_states=False,
-        )
+        ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if enable_autocast else nullcontext()
+        with ctx:
+            outputs = model(
+                **batch,
+                labels=labels,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
         loss_val = float(outputs.loss.item())
         ntok = int(labels.numel())
         total_loss += loss_val * ntok
@@ -1548,11 +1554,30 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
 
     prev_device = next(iter(model.parameters())).device
     model = model.to(args.DEV)
-    base_loss = _eval_calib_loss(model, eval_data, args.DEV)
-    print(f"[loss-aware] baseline calib loss={base_loss:.6f} using {len(eval_data)} batches (seq_len={eval_seq_len}, batch_size={eval_batch})")
+    full_max_batches = int(args.loss_aware_eval_max_batches) if int(args.loss_aware_eval_max_batches) > 0 else None
+    stage1_batches = max(1, int(args.loss_aware_stage1_batches))
+    stage1_topk = max(1, int(args.loss_aware_stage1_topk))
+    use_autocast_bf16 = bool(args.loss_aware_autocast_bf16)
+    eval_batches = min(len(eval_data), full_max_batches) if full_max_batches is not None else len(eval_data)
+    base_loss = _eval_calib_loss(
+        model,
+        eval_data,
+        args.DEV,
+        max_batches=full_max_batches,
+        use_autocast_bf16=use_autocast_bf16,
+    )
+    print(f"[loss-aware] baseline calib loss={base_loss:.6f} using {eval_batches} batches (seq_len={eval_seq_len}, batch_size={eval_batch})")
 
     candidates = _loss_aware_candidate_ratios(args)
     print(f"[loss-aware] ratio candidates: {', '.join(f'{r:.4f}' for r in candidates)}")
+    use_two_stage = bool(args.loss_aware_two_stage and len(candidates) > stage1_topk)
+    if use_two_stage:
+        print(
+            f"[loss-aware] two-stage enabled: stage1_batches={stage1_batches}, "
+            f"stage1_topk={stage1_topk}, full_batches={eval_batches}"
+        )
+    if use_autocast_bf16:
+        print("[loss-aware] eval autocast: bfloat16")
 
     layer_tables = []
     layer_full_sizes = []
@@ -1605,7 +1630,8 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         layer_full_sizes.append(layer_full)
 
         table = []
-        for ratio_i in candidates:
+
+        def _apply_ratio(ratio_i):
             cost_i = 0
             for name, mod in subset.items():
                 info = layer_cache[name]
@@ -1617,7 +1643,46 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                 w_hat = torch.matmul(U * S.unsqueeze(0), V)
                 mod.weight.data.copy_(w_hat.to(mod.weight.device, dtype=mod.weight.dtype))
                 cost_i += int(rank_k * (info["m"] + info["n"]))
-            loss_i = _eval_calib_loss(model, eval_data, args.DEV)
+            return cost_i
+
+        if use_two_stage:
+            coarse_table = []
+            for ratio_i in candidates:
+                cost_i = _apply_ratio(ratio_i)
+                loss_i = _eval_calib_loss(
+                    model,
+                    eval_data,
+                    args.DEV,
+                    max_batches=stage1_batches,
+                    use_autocast_bf16=use_autocast_bf16,
+                )
+                coarse_table.append({
+                    "ratio": float(ratio_i),
+                    "cost": int(cost_i),
+                    "loss": float(loss_i),
+                    "delta": float(loss_i - base_loss),
+                })
+            coarse_sorted = sorted(coarse_table, key=lambda x: x["delta"])
+            selected_ratios = {x["ratio"] for x in coarse_sorted[:stage1_topk]}
+            selected_ratios.add(min(candidates))
+            selected_ratios.add(max(candidates))
+            selected_ratios.add(min(candidates, key=lambda r: abs(float(r) - float(args.ratio))))
+            selected_candidates = sorted(selected_ratios)
+            if args.print_layer_ratios:
+                kept = ",".join([f"{x:.4f}" for x in selected_candidates])
+                print(f"[loss-aware] layer {li:02d} stage1 keep candidates: {kept}")
+        else:
+            selected_candidates = candidates
+
+        for ratio_i in selected_candidates:
+            cost_i = _apply_ratio(ratio_i)
+            loss_i = _eval_calib_loss(
+                model,
+                eval_data,
+                args.DEV,
+                max_batches=full_max_batches,
+                use_autocast_bf16=use_autocast_bf16,
+            )
             delta_i = loss_i - base_loss
             table.append({
                 "ratio": float(ratio_i),
@@ -1866,6 +1931,16 @@ if __name__ == '__main__':
         help='Optional comma-separated keep-ratio candidates (after internal ratio conversion), e.g. "0.32,0.36,0.40,0.44,0.48".')
     parser.add_argument('--loss_aware_include_bounds', action='store_true',
         help='When custom loss-aware candidates are provided, also include layer_ratio_min/max to keep allocator freedom.')
+    parser.add_argument('--loss_aware_two_stage', action='store_true',
+        help='Enable two-stage candidate evaluation: coarse screen all candidates, then fully evaluate top-k per layer.')
+    parser.add_argument('--loss_aware_stage1_batches', type=int, default=4,
+        help='Number of calibration batches used in stage-1 coarse screening (only when --loss_aware_two_stage).')
+    parser.add_argument('--loss_aware_stage1_topk', type=int, default=3,
+        help='Per-layer number of stage-1 best candidates kept for full evaluation (only when --loss_aware_two_stage).')
+    parser.add_argument('--loss_aware_eval_max_batches', type=int, default=0,
+        help='Cap the number of calibration batches per loss evaluation. 0 means using all available batches.')
+    parser.add_argument('--loss_aware_autocast_bf16', action='store_true',
+        help='Run loss-aware evaluation forwards under bfloat16 autocast on CUDA for speed.')
     parser.add_argument('--loss_aware_dp_bins', type=int, default=2000,
         help='DP budget bins for loss-aware layerwise allocation (larger = finer budget match, slower DP).')
     parser.add_argument('--use_module_rank_allocation', action='store_true', help='Allocate per-module ranks via spectrum + Lagrange')
