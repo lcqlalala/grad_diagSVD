@@ -1343,20 +1343,34 @@ def _get_transformer_layers(model_name, model):
 
 
 @torch.no_grad()
-def _eval_calib_loss(model, calib_data, dev, max_batches=None, use_autocast_bf16=False):
+def _eval_calib_loss(
+    model,
+    calib_data,
+    dev,
+    max_batches=None,
+    use_autocast_bf16=False,
+    early_stop_loss=None,
+    early_stop_min_batches=0,
+):
     prev_use_cache = getattr(model.config, "use_cache", None)
     if prev_use_cache is not None:
         model.config.use_cache = False
     model.eval()
-    dev_str = str(dev)
-    device_type = dev.type if isinstance(dev, torch.device) else dev_str.split(":")[0]
+    dev_obj = dev if isinstance(dev, torch.device) else torch.device(dev)
+    device_type = dev_obj.type
     enable_autocast = bool(use_autocast_bf16 and device_type == "cuda" and torch.cuda.is_available())
+    early_stop_min_batches = max(0, int(early_stop_min_batches))
     total_loss = 0.0
     total_tokens = 0
     for bi, batch in enumerate(calib_data):
         if max_batches is not None and bi >= max_batches:
             break
-        batch = {k: v.to(dev) for k, v in batch.items()}
+        # If calibration batches are preloaded on device, avoid repeated copies.
+        first_tensor = next(iter(batch.values()))
+        if first_tensor.device == dev_obj:
+            batch = batch
+        else:
+            batch = {k: v.to(dev_obj, non_blocking=True) for k, v in batch.items()}
         labels = batch["input_ids"]
         ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if enable_autocast else nullcontext()
         with ctx:
@@ -1371,6 +1385,14 @@ def _eval_calib_loss(model, calib_data, dev, max_batches=None, use_autocast_bf16
         ntok = int(labels.numel())
         total_loss += loss_val * ntok
         total_tokens += ntok
+        if (
+            early_stop_loss is not None
+            and total_tokens > 0
+            and (bi + 1) >= early_stop_min_batches
+        ):
+            running_loss = total_loss / total_tokens
+            if running_loss > float(early_stop_loss):
+                break
     if prev_use_cache is not None:
         model.config.use_cache = prev_use_cache
     if total_tokens <= 0:
@@ -1551,6 +1573,14 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         )
     if len(eval_data) > eval_nsamples:
         eval_data = eval_data[:eval_nsamples]
+    if args.loss_aware_cache_on_device:
+        try:
+            eval_data = [{k: v.to(args.DEV, non_blocking=True) for k, v in batch.items()} for batch in eval_data]
+            print(f"[loss-aware] calibration batches cached on device={args.DEV}")
+        except RuntimeError as e:
+            print(f"[loss-aware] WARNING: cache_on_device failed ({e}), fallback to host batches.")
+            if "cuda" in str(args.DEV):
+                torch.cuda.empty_cache()
 
     prev_device = next(iter(model.parameters())).device
     model = model.to(args.DEV)
@@ -1558,6 +1588,9 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
     stage1_batches = max(1, int(args.loss_aware_stage1_batches))
     stage1_topk = max(1, int(args.loss_aware_stage1_topk))
     use_autocast_bf16 = bool(args.loss_aware_autocast_bf16)
+    use_early_stop = bool(args.loss_aware_early_stop)
+    early_stop_margin = float(args.loss_aware_early_stop_margin)
+    early_stop_min_batches = max(1, int(args.loss_aware_early_stop_min_batches))
     eval_batches = min(len(eval_data), full_max_batches) if full_max_batches is not None else len(eval_data)
     base_loss = _eval_calib_loss(
         model,
@@ -1578,6 +1611,11 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         )
     if use_autocast_bf16:
         print("[loss-aware] eval autocast: bfloat16")
+    if use_early_stop:
+        print(
+            f"[loss-aware] early-stop enabled: margin={early_stop_margin:.6f}, "
+            f"min_batches={early_stop_min_batches}"
+        )
 
     layer_tables = []
     layer_full_sizes = []
@@ -1668,21 +1706,31 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             selected_ratios.add(max(candidates))
             selected_ratios.add(min(candidates, key=lambda r: abs(float(r) - float(args.ratio))))
             selected_candidates = sorted(selected_ratios)
+            coarse_delta_map = {x["ratio"]: x["delta"] for x in coarse_sorted}
+            eval_order = sorted(selected_candidates, key=lambda r: coarse_delta_map.get(float(r), float("inf")))
             if args.print_layer_ratios:
                 kept = ",".join([f"{x:.4f}" for x in selected_candidates])
                 print(f"[loss-aware] layer {li:02d} stage1 keep candidates: {kept}")
         else:
             selected_candidates = candidates
+            eval_order = list(selected_candidates)
 
-        for ratio_i in selected_candidates:
+        layer_best_loss = float("inf")
+        for ratio_i in eval_order:
             cost_i = _apply_ratio(ratio_i)
+            stop_loss = None
+            if use_early_stop and layer_best_loss < float("inf"):
+                stop_loss = layer_best_loss + early_stop_margin
             loss_i = _eval_calib_loss(
                 model,
                 eval_data,
                 args.DEV,
                 max_batches=full_max_batches,
                 use_autocast_bf16=use_autocast_bf16,
+                early_stop_loss=stop_loss,
+                early_stop_min_batches=early_stop_min_batches,
             )
+            layer_best_loss = min(layer_best_loss, loss_i)
             delta_i = loss_i - base_loss
             table.append({
                 "ratio": float(ratio_i),
@@ -1690,6 +1738,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                 "loss": float(loss_i),
                 "delta": float(delta_i),
             })
+        table.sort(key=lambda x: x["ratio"])
         for name, mod in subset.items():
             mod.weight.data.copy_(layer_cache[name]["backup"].to(mod.weight.device, dtype=mod.weight.dtype))
         layer_cache.clear()
@@ -1941,6 +1990,14 @@ if __name__ == '__main__':
         help='Cap the number of calibration batches per loss evaluation. 0 means using all available batches.')
     parser.add_argument('--loss_aware_autocast_bf16', action='store_true',
         help='Run loss-aware evaluation forwards under bfloat16 autocast on CUDA for speed.')
+    parser.add_argument('--loss_aware_cache_on_device', action='store_true',
+        help='Preload loss-aware calibration batches onto args.DEV to reduce host->device copy overhead.')
+    parser.add_argument('--loss_aware_early_stop', action='store_true',
+        help='Enable candidate loss early-stop when running loss is already worse than current layer-best by a margin.')
+    parser.add_argument('--loss_aware_early_stop_margin', type=float, default=0.003,
+        help='Loss margin for early-stop (stop when running_loss > layer_best + margin).')
+    parser.add_argument('--loss_aware_early_stop_min_batches', type=int, default=4,
+        help='Minimum number of batches evaluated before early-stop can trigger.')
     parser.add_argument('--loss_aware_dp_bins', type=int, default=2000,
         help='DP budget bins for loss-aware layerwise allocation (larger = finer budget match, slower DP).')
     parser.add_argument('--use_module_rank_allocation', action='store_true', help='Allocate per-module ranks via spectrum + Lagrange')
