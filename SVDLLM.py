@@ -921,9 +921,11 @@ def whitening_local_update(
     bi_v_ridge=1e-5,
     bi_sigma_eps=1e-6,
     print_layer_rank_detail=False,
+    update_layer_batch_size=1,
 ):
     print("Start SVD decomposition then update "
-          f"(bi_closed_form={use_bi_closed_form}, weighted={use_weighted_update}, weight_mode={bi_weight_mode})...")
+          f"(bi_closed_form={use_bi_closed_form}, weighted={use_weighted_update}, "
+          f"weight_mode={bi_weight_mode}, layer_batch_size={update_layer_batch_size})...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
     if "opt" in model_name:
@@ -978,6 +980,26 @@ def whitening_local_update(
     attention_masks = cache['attention_mask']
     if "opt" not in model_name:
         position_ids = cache['position_ids']
+    update_layer_batch_size = max(1, int(update_layer_batch_size))
+
+    def _layer_forward_chunked(layer_mod, hs, attn, pos_ids=None):
+        n = hs.shape[0]
+        out_all = torch.empty_like(hs)
+        for st in range(0, n, update_layer_batch_size):
+            ed = min(n, st + update_layer_batch_size)
+            if "opt" not in model_name:
+                out_all[st:ed] = layer_mod(
+                    hs[st:ed],
+                    attention_mask=attn[st:ed],
+                    position_ids=pos_ids[st:ed],
+                )[0]
+            else:
+                out_all[st:ed] = layer_mod(
+                    hs[st:ed],
+                    attention_mask=attn[st:ed],
+                )[0]
+        return out_all
+
     global_full_params = 0
     global_low_params = 0
     global_cost_sum = 0
@@ -1041,9 +1063,9 @@ def whitening_local_update(
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
+            outs = _layer_forward_chunked(layer, inps, attention_masks, position_ids)
         else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+            outs = _layer_forward_chunked(layer, inps, attention_masks, None)
         for h in handles:
             h.remove()
         for name in gpts:
@@ -1119,9 +1141,9 @@ def whitening_local_update(
         global_cost_sum += layer_cost_sum
         layer = layer.to(dev)
         if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
+            outs = _layer_forward_chunked(layer, inps, attention_masks, position_ids)
         else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+            outs = _layer_forward_chunked(layer, inps, attention_masks, None)
         layers[i] = layer.cpu()
         del gpts
         torch.cuda.empty_cache()
@@ -2041,6 +2063,8 @@ if __name__ == '__main__':
         help='Numerical epsilon for inverting singular values in bi-side V-step.')
     parser.add_argument('--update_use_fp32', action='store_true',
         help='Cast model to fp32 before local update (step 2/3). Default keeps model dtype (e.g. fp16).')
+    parser.add_argument('--update_layer_batch_size', type=int, default=1,
+        help='Micro-batch size for per-layer forward in local update (step 2/3). Smaller value reduces VRAM peak.')
     parser.add_argument('--debug_svd', action='store_true', help='Print per-module truncation error and G stats for debugging')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
@@ -2147,6 +2171,7 @@ if __name__ == '__main__':
             bi_v_ridge=args.bi_v_ridge,
             bi_sigma_eps=args.bi_sigma_eps,
             print_layer_rank_detail=args.print_layer_rank_detail,
+            update_layer_batch_size=args.update_layer_batch_size,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')
@@ -2196,6 +2221,7 @@ if __name__ == '__main__':
             bi_v_ridge=args.bi_v_ridge,
             bi_sigma_eps=args.bi_sigma_eps,
             print_layer_rank_detail=args.print_layer_rank_detail,
+            update_layer_batch_size=args.update_layer_batch_size,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')
