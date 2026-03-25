@@ -1170,20 +1170,25 @@ class local_update:
         self.bi_u_ridge = float(bi_u_ridge)
         self.bi_v_ridge = float(bi_v_ridge)
         self.bi_sigma_eps = float(bi_sigma_eps)
-        W = layer.weight.data.clone()
+        # Keep model weights in original dtype (e.g. fp16), but run closed-form
+        # solves in fp32 for numerical stability and dtype consistency.
+        W = layer.weight.data.detach().to(self.dev, dtype=torch.float32).clone()
         self.rows = W.shape[0]
         self.columns = W.shape[1]
         if direct_update:
             self.U, self.S, self.VT = torch.linalg.svd(W.data, full_matrices=False)
         else: 
+            scaling_diag_matrix = scaling_diag_matrix.to(self.dev, dtype=torch.float32)
             try:
                 scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
             except Exception as e:
                 print("Warning: scaling_diag_matrix is not full rank!")
-                scaling_diag_matrix += 1e-6 * torch.eye(scaling_diag_matrix.shape[0])
+                scaling_diag_matrix += 1e-6 * torch.eye(
+                    scaling_diag_matrix.shape[0],
+                    device=self.dev,
+                    dtype=scaling_diag_matrix.dtype,
+                )
                 scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
-            scaling_diag_matrix = scaling_diag_matrix.float()
-            scaling_matrix_inv = scaling_matrix_inv.float()
             W_scale = torch.matmul(W, scaling_diag_matrix)
             self.U, self.S, self.VT = torch.linalg.svd(W_scale, full_matrices=False)  
         # truncation SVD
@@ -1202,12 +1207,15 @@ class local_update:
             else:
                 rel_err = 0.0
             print(f"[debug] {self.name} k={num_s_after_trunc} rel_err={rel_err:.6f}")
-        self.truc_s = self.S[:num_s_after_trunc].cuda()
-        self.truc_u = self.U[:, :num_s_after_trunc].cuda()
+        self.truc_s = self.S[:num_s_after_trunc].to(self.dev, dtype=torch.float32)
+        self.truc_u = self.U[:, :num_s_after_trunc].to(self.dev, dtype=torch.float32)
         if direct_update:
-            self.truc_v = self.VT[:num_s_after_trunc, :].cuda()
+            self.truc_v = self.VT[:num_s_after_trunc, :].to(self.dev, dtype=torch.float32)
         else:
-            self.truc_v = torch.matmul(self.VT[:num_s_after_trunc, :].cuda(), scaling_matrix_inv)
+            self.truc_v = torch.matmul(
+                self.VT[:num_s_after_trunc, :].to(self.dev, dtype=torch.float32),
+                scaling_matrix_inv,
+            )
         self.truc_sigma = torch.diag(self.truc_s)
         self.new_w = torch.matmul(self.truc_u, torch.matmul(self.truc_sigma, self.truc_v[:num_s_after_trunc, :]))
         # intialize H for close form solution
@@ -2031,6 +2039,8 @@ if __name__ == '__main__':
         help='Ridge coefficient for V-step closed-form solve.')
     parser.add_argument('--bi_sigma_eps', type=float, default=1e-6,
         help='Numerical epsilon for inverting singular values in bi-side V-step.')
+    parser.add_argument('--update_use_fp32', action='store_true',
+        help='Cast model to fp32 before local update (step 2/3). Default keeps model dtype (e.g. fp16).')
     parser.add_argument('--debug_svd', action='store_true', help='Print per-module truncation error and G stats for debugging')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
@@ -2088,7 +2098,8 @@ if __name__ == '__main__':
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         model = model.eval()
-        model = model.float()  # need to set to float
+        if args.update_use_fp32:
+            model = model.float()
         layer_ratios = None
         module_ranks = None
         cali_white_data = None
@@ -2142,7 +2153,8 @@ if __name__ == '__main__':
     elif args.step == 3:
         model, tokenizer = get_model_from_huggingface(args.model)
         model = model.eval()
-        model = model.float()
+        if args.update_use_fp32:
+            model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         layer_ratios = None
         module_ranks = None
