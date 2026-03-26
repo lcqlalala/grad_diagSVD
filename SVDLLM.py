@@ -1253,6 +1253,11 @@ class local_update:
         self._acc_xy = None
         self._acc_out_sq = 0.0
         self._acc_base_err_sq = 0.0
+        # Holdout statistics for model selection (base / u_only / bi_side).
+        # Fit uses _acc_*, selection prefers _sel_* when available.
+        self._sel_xx = None
+        self._sel_xy = None
+        self._sel_out_sq = 0.0
         self._solved_once = False
 
     def _solve_weighted_ridge(self, X, Y, weights=None, ridge=0.0, prior=None):
@@ -1307,15 +1312,34 @@ class local_update:
             print(f"[debug] {self.name} solver fallback: pinv")
         return torch.linalg.pinv(lhs2 + 1e-4 * eye).matmul(rhs2)
 
-    def _objective_from_stats(self, A):
+    def _objective_from_stats(self, A, xx=None, xy=None, out_sq=None):
         # SSE(A) = ||XA - Y||_F^2 = tr(A^T XX A) - 2 tr(A^T XY) + tr(Y^T Y)
-        term1 = torch.sum(A * (self._acc_xx.matmul(A)))
-        term2 = torch.sum(A * self._acc_xy)
-        sse = term1 - 2.0 * term2 + float(self._acc_out_sq)
+        # Use float64 to avoid catastrophic cancellation at large scales.
+        if xx is None:
+            xx = self._acc_xx
+        if xy is None:
+            xy = self._acc_xy
+        if out_sq is None:
+            out_sq = self._acc_out_sq
+        A64 = A.to(dtype=torch.float64)
+        XX64 = xx.to(dtype=torch.float64)
+        XY64 = xy.to(dtype=torch.float64)
+        term1 = torch.sum(A64 * (XX64.matmul(A64)))
+        term2 = torch.sum(A64 * XY64)
+        out_sq = float(out_sq)
+        sse = term1 - 2.0 * term2 + out_sq
         sse_val = float(sse.item()) if torch.is_tensor(sse) else float(sse)
         if not math.isfinite(sse_val):
             return float("inf")
-        return max(0.0, sse_val)
+        # Small negative values can appear from round-off. Clamp only when tiny.
+        if sse_val < 0.0:
+            scale = max(1.0, abs(float(term1.item())) + abs(float((2.0 * term2).item())) + abs(out_sq))
+            if sse_val > -1e-10 * scale:
+                return 0.0
+            if self.debug_svd:
+                print(f"[debug] {self.name} objective negative due numeric error: {sse_val:.6e}")
+            return 0.0
+        return sse_val
 
     def _compute_sample_weights(self, outs, base_output, eps=1e-12):
         if (not self.use_weighted_update) or self.bi_weight_mode == "uniform":
@@ -1350,8 +1374,25 @@ class local_update:
             xw = x_latent
             yw = outs
 
-        xx = xw.t().matmul(xw)
-        xy = xw.t().matmul(yw)
+        # Split data into fit (7/8) and holdout (1/8) for safer candidate selection.
+        n_rows = int(xw.shape[0])
+        if n_rows >= 8:
+            idx = torch.arange(n_rows, device=xw.device)
+            sel_mask = (idx % 8 == 0)
+            fit_mask = ~sel_mask
+        else:
+            sel_mask = None
+            fit_mask = None
+
+        if fit_mask is None or int(fit_mask.sum().item()) <= 0:
+            x_fit, y_fit = xw, yw
+            x_sel, y_sel = None, None
+        else:
+            x_fit, y_fit = xw[fit_mask], yw[fit_mask]
+            x_sel, y_sel = xw[sel_mask], yw[sel_mask]
+
+        xx = x_fit.t().matmul(x_fit)
+        xy = x_fit.t().matmul(y_fit)
         if self._acc_xx is None:
             self._acc_xx = xx
             self._acc_xy = xy
@@ -1359,21 +1400,39 @@ class local_update:
             self._acc_xx = self._acc_xx + xx
             self._acc_xy = self._acc_xy + xy
 
+        if x_sel is not None and x_sel.numel() > 0:
+            xx_sel = x_sel.t().matmul(x_sel)
+            xy_sel = x_sel.t().matmul(y_sel)
+            if self._sel_xx is None:
+                self._sel_xx = xx_sel
+                self._sel_xy = xy_sel
+            else:
+                self._sel_xx = self._sel_xx + xx_sel
+                self._sel_xy = self._sel_xy + xy_sel
+            self._sel_out_sq += float(torch.sum(y_sel ** 2).item())
+
         self._acc_base_err_sq += float(torch.sum((outs - base_output) ** 2).item())
         self._acc_out_sq += float(torch.sum(outs ** 2).item())
 
-        inps = outs = x_latent = base_output = xw = yw = xx = xy = None
-        del inps, outs, x_latent, base_output, xw, yw, xx, xy
+        inps = outs = x_latent = base_output = xw = yw = xx = xy = x_fit = y_fit = x_sel = y_sel = None
+        del inps, outs, x_latent, base_output, xw, yw, xx, xy, x_fit, y_fit, x_sel, y_sel
     
     def fasterprune(self):
         _t0 = time.time() if self.debug_svd else None
         if (not self._solved_once) and (self._acc_xx is not None):
+            def _is_better(new_val, old_val):
+                tol = max(1e-6, 1e-4 * max(1.0, old_val))
+                return new_val < (old_val - tol)
+
             base_uT = self.truc_u.t()
             base_v = self.truc_v
             best_uT = base_uT
             best_v = base_v
             best_tag = "base"
-            best_sse = self._objective_from_stats(base_uT)
+            sel_xx = self._sel_xx if self._sel_xx is not None else self._acc_xx
+            sel_xy = self._sel_xy if self._sel_xy is not None else self._acc_xy
+            sel_out_sq = self._sel_out_sq if self._sel_xx is not None else self._acc_out_sq
+            best_sse = self._objective_from_stats(base_uT, xx=sel_xx, xy=sel_xy, out_sq=sel_out_sq)
 
             # Step 1: fixed V, solve U once from aggregated normal equations.
             u_prior = base_uT
@@ -1384,8 +1443,8 @@ class local_update:
                 prior=u_prior,
             )
             if torch.isfinite(updated_uT).all():
-                u_sse = self._objective_from_stats(updated_uT)
-                if u_sse <= best_sse:
+                u_sse = self._objective_from_stats(updated_uT, xx=sel_xx, xy=sel_xy, out_sq=sel_out_sq)
+                if _is_better(u_sse, best_sse):
                     best_uT = updated_uT
                     best_v = base_v
                     best_tag = "u_only"
@@ -1424,8 +1483,8 @@ class local_update:
                 bi_v = sigma_inv.matmul(r_corr.t().matmul(sigma.matmul(self.truc_v)))
                 if torch.isfinite(r_corr).all() and torch.isfinite(bi_v).all():
                     bi_A = r_corr.matmul(updated_uT if torch.isfinite(updated_uT).all() else best_uT)
-                    bi_sse = self._objective_from_stats(bi_A)
-                    if bi_sse <= best_sse:
+                    bi_sse = self._objective_from_stats(bi_A, xx=sel_xx, xy=sel_xy, out_sq=sel_out_sq)
+                    if _is_better(bi_sse, best_sse):
                         best_uT = updated_uT if torch.isfinite(updated_uT).all() else best_uT
                         best_v = bi_v
                         best_tag = "bi_side"
@@ -1455,6 +1514,7 @@ class local_update:
             self.appendU = self.truc_u.matmul(sqrtSigma)
             self.appendV = sqrtSigma.matmul(self.truc_v)
         self._acc_xx = self._acc_xy = None
+        self._sel_xx = self._sel_xy = None
         if self.debug_svd and _t0 is not None:
             print(f"[debug] {self.name} fasterprune_solve_time={time.time()-_t0:.3f}s")
         return self.appendU, self.appendV
