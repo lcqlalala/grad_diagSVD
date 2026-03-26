@@ -1423,6 +1423,7 @@ class local_update:
             def _is_better(new_val, old_val):
                 tol = max(1e-6, 1e-4 * max(1.0, old_val))
                 return new_val < (old_val - tol)
+            min_rel_gain = 5e-3  # require at least 0.5% holdout SSE gain
 
             base_uT = self.truc_u.t()
             base_v = self.truc_v
@@ -1444,7 +1445,8 @@ class local_update:
             )
             if torch.isfinite(updated_uT).all():
                 u_sse = self._objective_from_stats(updated_uT, xx=sel_xx, xy=sel_xy, out_sq=sel_out_sq)
-                if _is_better(u_sse, best_sse):
+                rel_gain_u = (best_sse - u_sse) / max(best_sse, 1e-12)
+                if _is_better(u_sse, best_sse) and rel_gain_u >= min_rel_gain:
                     best_uT = updated_uT
                     best_v = base_v
                     best_tag = "u_only"
@@ -1484,7 +1486,8 @@ class local_update:
                 if torch.isfinite(r_corr).all() and torch.isfinite(bi_v).all():
                     bi_A = r_corr.matmul(updated_uT if torch.isfinite(updated_uT).all() else best_uT)
                     bi_sse = self._objective_from_stats(bi_A, xx=sel_xx, xy=sel_xy, out_sq=sel_out_sq)
-                    if _is_better(bi_sse, best_sse):
+                    rel_gain_bi = (best_sse - bi_sse) / max(best_sse, 1e-12)
+                    if _is_better(bi_sse, best_sse) and rel_gain_bi >= min_rel_gain:
                         best_uT = updated_uT if torch.isfinite(updated_uT).all() else best_uT
                         best_v = bi_v
                         best_tag = "bi_side"
