@@ -1276,10 +1276,14 @@ class local_update:
         lhs2 = lhs
         rhs2 = rhs
         if ridge > 0:
+            # Scale ridge by matrix magnitude so the same CLI value is meaningful
+            # across layers/ranks with very different activation energy.
+            lhs_scale = torch.trace(lhs2).abs() / max(1, int(lhs2.shape[0]))
+            ridge_eff = float(ridge) * float(max(float(lhs_scale.item()), 1e-8))
             eye = torch.eye(lhs2.shape[0], device=lhs2.device, dtype=lhs2.dtype)
-            lhs2 = lhs2 + ridge * eye
+            lhs2 = lhs2 + ridge_eff * eye
             if prior is not None:
-                rhs2 = rhs2 + ridge * prior
+                rhs2 = rhs2 + ridge_eff * prior
         # Robust solver path: avoid expensive lstsq fallback on ill-conditioned
         # matrices; try Cholesky with jitter first, then solve, then pinv.
         eye = torch.eye(lhs2.shape[0], device=lhs2.device, dtype=lhs2.dtype)
@@ -1291,13 +1295,27 @@ class local_update:
                     return torch.cholesky_solve(rhs2, chol)
             except Exception:
                 pass
+        for jitter in (0.0, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3):
+            mat = lhs2 if jitter == 0.0 else (lhs2 + jitter * eye)
             try:
-                return torch.linalg.solve(mat, rhs2)
+                sol = torch.linalg.solve(mat, rhs2)
+                if torch.isfinite(sol).all():
+                    return sol
             except Exception:
                 pass
         if self.debug_svd:
             print(f"[debug] {self.name} solver fallback: pinv")
-        return torch.linalg.pinv(lhs2).matmul(rhs2)
+        return torch.linalg.pinv(lhs2 + 1e-4 * eye).matmul(rhs2)
+
+    def _objective_from_stats(self, A):
+        # SSE(A) = ||XA - Y||_F^2 = tr(A^T XX A) - 2 tr(A^T XY) + tr(Y^T Y)
+        term1 = torch.sum(A * (self._acc_xx.matmul(A)))
+        term2 = torch.sum(A * self._acc_xy)
+        sse = term1 - 2.0 * term2 + float(self._acc_out_sq)
+        sse_val = float(sse.item()) if torch.is_tensor(sse) else float(sse)
+        if not math.isfinite(sse_val):
+            return float("inf")
+        return max(0.0, sse_val)
 
     def _compute_sample_weights(self, outs, base_output, eps=1e-12):
         if (not self.use_weighted_update) or self.bi_weight_mode == "uniform":
@@ -1350,18 +1368,34 @@ class local_update:
     def fasterprune(self):
         _t0 = time.time() if self.debug_svd else None
         if (not self._solved_once) and (self._acc_xx is not None):
+            base_uT = self.truc_u.t()
+            base_v = self.truc_v
+            best_uT = base_uT
+            best_v = base_v
+            best_tag = "base"
+            best_sse = self._objective_from_stats(base_uT)
+
             # Step 1: fixed V, solve U once from aggregated normal equations.
-            u_prior = self.truc_u.t()
-            self.updated_uT = self._solve_ridge_from_stats(
+            u_prior = base_uT
+            updated_uT = self._solve_ridge_from_stats(
                 self._acc_xx,
                 self._acc_xy,
                 ridge=self.bi_u_ridge,
                 prior=u_prior,
             )
+            if torch.isfinite(updated_uT).all():
+                u_sse = self._objective_from_stats(updated_uT)
+                if u_sse <= best_sse:
+                    best_uT = updated_uT
+                    best_v = base_v
+                    best_tag = "u_only"
+                    best_sse = u_sse
+            elif self.debug_svd:
+                print(f"[debug] {self.name} invalid U-step (non-finite), fallback to base.")
 
             # Step 2: fixed U, solve rank-space right correction once.
             if self.use_bi_closed_form:
-                u_mat = self.updated_uT.t()                 # [d_out, r]
+                u_mat = updated_uT.t() if torch.isfinite(updated_uT).all() else best_uT.t()
                 rhs_r = self._acc_xy.matmul(u_mat)         # [r, r]
                 r_prior = torch.eye(self.rank, device=self.dev, dtype=rhs_r.dtype)
                 r_corr = self._solve_ridge_from_stats(
@@ -1371,10 +1405,23 @@ class local_update:
                     prior=r_prior,
                 )
                 sigma = self.truc_sigma
-                sigma_inv = torch.diag(1.0 / torch.clamp(self.truc_s, min=self.bi_sigma_eps))
-                self.updated_truc_v = sigma_inv.matmul(r_corr.t().matmul(sigma.matmul(self.truc_v)))
-            else:
-                self.updated_truc_v = self.truc_v
+                sigma_floor = max(float(self.bi_sigma_eps), 1e-4 * float(self.truc_s.max().item()))
+                sigma_inv = torch.diag(1.0 / torch.clamp(self.truc_s, min=sigma_floor))
+                bi_v = sigma_inv.matmul(r_corr.t().matmul(sigma.matmul(self.truc_v)))
+                if torch.isfinite(r_corr).all() and torch.isfinite(bi_v).all():
+                    bi_A = r_corr.matmul(updated_uT if torch.isfinite(updated_uT).all() else best_uT)
+                    bi_sse = self._objective_from_stats(bi_A)
+                    if bi_sse <= best_sse:
+                        best_uT = updated_uT if torch.isfinite(updated_uT).all() else best_uT
+                        best_v = bi_v
+                        best_tag = "bi_side"
+                        best_sse = bi_sse
+                elif self.debug_svd:
+                    print(f"[debug] {self.name} invalid bi-step (non-finite), fallback to safer solution.")
+            self.updated_uT = best_uT
+            self.updated_truc_v = best_v
+            if self.debug_svd:
+                print(f"[debug] {self.name} correction_select={best_tag} sse={best_sse:.6e}")
 
             if self._acc_out_sq > 0:
                 self.error = math.sqrt(self._acc_base_err_sq / max(self._acc_out_sq, 1e-12))
@@ -1383,6 +1430,16 @@ class local_update:
         sqrtSigma = torch.sqrt(self.truc_sigma)
         self.appendU = self.updated_uT.t().matmul(sqrtSigma)
         self.appendV = sqrtSigma.matmul(self.updated_truc_v)
+        if (
+            (not torch.isfinite(self.appendU).all())
+            or (not torch.isfinite(self.appendV).all())
+            or float(self.appendU.abs().max().item()) > 6e4
+            or float(self.appendV.abs().max().item()) > 6e4
+        ):
+            if self.debug_svd:
+                print(f"[debug] {self.name} final factors unstable, fallback to truncated SVD factors.")
+            self.appendU = self.truc_u.matmul(sqrtSigma)
+            self.appendV = sqrtSigma.matmul(self.truc_v)
         self._acc_xx = self._acc_xy = None
         if self.debug_svd and _t0 is not None:
             print(f"[debug] {self.name} fasterprune_solve_time={time.time()-_t0:.3f}s")
