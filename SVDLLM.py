@@ -4,6 +4,7 @@ import sys
 import argparse
 import heapq
 import math
+import time
 from contextlib import nullcontext
 import torch.jit
 from tqdm import tqdm
@@ -1245,6 +1246,14 @@ class local_update:
         # One-shot initialization: if hooks are skipped, fallback to truncated factors.
         self.updated_uT = self.truc_u.t().clone()
         self.updated_truc_v = self.truc_v.clone()
+        # Streaming sufficient statistics across chunks:
+        #   XX = X^T W X,  XY = X^T W Y
+        # Then solve closed-form once in fasterprune().
+        self._acc_xx = None
+        self._acc_xy = None
+        self._acc_out_sq = 0.0
+        self._acc_base_err_sq = 0.0
+        self._solved_once = False
 
     def _solve_weighted_ridge(self, X, Y, weights=None, ridge=0.0, prior=None):
         if weights is not None:
@@ -1261,11 +1270,34 @@ class local_update:
             lhs = lhs + ridge * eye
             if prior is not None:
                 rhs = rhs + ridge * prior
-        try:
-            sol = torch.linalg.solve(lhs, rhs)
-        except Exception:
-            sol = torch.linalg.lstsq(lhs, rhs).solution
-        return sol
+        return self._solve_ridge_from_stats(lhs, rhs, ridge=0.0, prior=None)
+
+    def _solve_ridge_from_stats(self, lhs, rhs, ridge=0.0, prior=None):
+        lhs2 = lhs
+        rhs2 = rhs
+        if ridge > 0:
+            eye = torch.eye(lhs2.shape[0], device=lhs2.device, dtype=lhs2.dtype)
+            lhs2 = lhs2 + ridge * eye
+            if prior is not None:
+                rhs2 = rhs2 + ridge * prior
+        # Robust solver path: avoid expensive lstsq fallback on ill-conditioned
+        # matrices; try Cholesky with jitter first, then solve, then pinv.
+        eye = torch.eye(lhs2.shape[0], device=lhs2.device, dtype=lhs2.dtype)
+        for jitter in (0.0, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3):
+            mat = lhs2 if jitter == 0.0 else (lhs2 + jitter * eye)
+            try:
+                chol, info = torch.linalg.cholesky_ex(mat)
+                if int(info.max().item()) == 0:
+                    return torch.cholesky_solve(rhs2, chol)
+            except Exception:
+                pass
+            try:
+                return torch.linalg.solve(mat, rhs2)
+            except Exception:
+                pass
+        if self.debug_svd:
+            print(f"[debug] {self.name} solver fallback: pinv")
+        return torch.linalg.pinv(lhs2).matmul(rhs2)
 
     def _compute_sample_weights(self, outs, base_output, eps=1e-12):
         if (not self.use_weighted_update) or self.bi_weight_mode == "uniform":
@@ -1291,61 +1323,69 @@ class local_update:
         # Rank-space feature used by both U-step and V-step.
         x_latent = torch.matmul(torch.matmul(inps, self.truc_v.t()), self.truc_sigma)  # [N, r]
         base_output = torch.matmul(x_latent, self.truc_u.t())  # [N, d_out]
-        out_norm = torch.norm(outs, p="fro").clamp_min(1e-12)
-        self.error = torch.sqrt(torch.sum((outs - base_output) ** 2)).item() / out_norm.item()
-
         weights = self._compute_sample_weights(outs, base_output)
-
-        # Step 1: fixed V, solve U in closed form (weighted ridge LS).
-        u_prior = self.truc_u.t()
-        self.updated_uT = self._solve_weighted_ridge(
-            x_latent,
-            outs,
-            weights=weights,
-            ridge=self.bi_u_ridge,
-            prior=u_prior,
-        )
-
-        # Step 2: fixed U, solve right factor one-shot in rank space.
-        if self.use_bi_closed_form:
-            u_mat = self.updated_uT.t()                     # [d_out, r]
-            target_latent = torch.matmul(outs, u_mat)      # [N, r]
-            r_prior = torch.eye(self.rank, device=self.dev, dtype=x_latent.dtype)
-            r_corr = self._solve_weighted_ridge(
-                x_latent,
-                target_latent,
-                weights=weights,
-                ridge=self.bi_v_ridge,
-                prior=r_prior,
-            )  # [r, r]
-            sigma = self.truc_sigma
-            sigma_inv = torch.diag(1.0 / torch.clamp(self.truc_s, min=self.bi_sigma_eps))
-            # Enforce x_new = x_latent @ r_corr via V update:
-            # V_new^T = V^T Σ R Σ^{-1}  =>  V_new = Σ^{-1} R^T Σ V.
-            self.updated_truc_v = sigma_inv.matmul(r_corr.t().matmul(sigma.matmul(self.truc_v)))
+        if weights is not None:
+            sw = torch.sqrt(weights).unsqueeze(1)
+            xw = x_latent * sw
+            yw = outs * sw
         else:
-            self.updated_truc_v = self.truc_v
+            xw = x_latent
+            yw = outs
 
-        updated_latent = torch.matmul(torch.matmul(inps, self.updated_truc_v.t()), self.truc_sigma)
-        updated_output = torch.matmul(updated_latent, self.updated_uT)
-        self.updated_error = torch.sqrt(torch.sum((outs - updated_output) ** 2)).item() / out_norm.item()
-        if self.debug_svd:
-            if weights is None:
-                print(f"[debug] {self.name} one-shot: rel_err {self.error:.6f} -> {self.updated_error:.6f}")
-            else:
-                wmin = float(weights.min().item())
-                wmax = float(weights.max().item())
-                print(f"[debug] {self.name} one-shot: rel_err {self.error:.6f} -> {self.updated_error:.6f}  "
-                      f"weights[{wmin:.3f},{wmax:.3f}]")
+        xx = xw.t().matmul(xw)
+        xy = xw.t().matmul(yw)
+        if self._acc_xx is None:
+            self._acc_xx = xx
+            self._acc_xy = xy
+        else:
+            self._acc_xx = self._acc_xx + xx
+            self._acc_xy = self._acc_xy + xy
 
-        inps = outs = x_latent = base_output = updated_latent = updated_output = None
-        del inps, outs, x_latent, base_output, updated_latent, updated_output
-        torch.cuda.empty_cache()
+        self._acc_base_err_sq += float(torch.sum((outs - base_output) ** 2).item())
+        self._acc_out_sq += float(torch.sum(outs ** 2).item())
+
+        inps = outs = x_latent = base_output = xw = yw = xx = xy = None
+        del inps, outs, x_latent, base_output, xw, yw, xx, xy
     
     def fasterprune(self):
+        _t0 = time.time() if self.debug_svd else None
+        if (not self._solved_once) and (self._acc_xx is not None):
+            # Step 1: fixed V, solve U once from aggregated normal equations.
+            u_prior = self.truc_u.t()
+            self.updated_uT = self._solve_ridge_from_stats(
+                self._acc_xx,
+                self._acc_xy,
+                ridge=self.bi_u_ridge,
+                prior=u_prior,
+            )
+
+            # Step 2: fixed U, solve rank-space right correction once.
+            if self.use_bi_closed_form:
+                u_mat = self.updated_uT.t()                 # [d_out, r]
+                rhs_r = self._acc_xy.matmul(u_mat)         # [r, r]
+                r_prior = torch.eye(self.rank, device=self.dev, dtype=rhs_r.dtype)
+                r_corr = self._solve_ridge_from_stats(
+                    self._acc_xx,
+                    rhs_r,
+                    ridge=self.bi_v_ridge,
+                    prior=r_prior,
+                )
+                sigma = self.truc_sigma
+                sigma_inv = torch.diag(1.0 / torch.clamp(self.truc_s, min=self.bi_sigma_eps))
+                self.updated_truc_v = sigma_inv.matmul(r_corr.t().matmul(sigma.matmul(self.truc_v)))
+            else:
+                self.updated_truc_v = self.truc_v
+
+            if self._acc_out_sq > 0:
+                self.error = math.sqrt(self._acc_base_err_sq / max(self._acc_out_sq, 1e-12))
+            self._solved_once = True
+
         sqrtSigma = torch.sqrt(self.truc_sigma)
         self.appendU = self.updated_uT.t().matmul(sqrtSigma)
         self.appendV = sqrtSigma.matmul(self.updated_truc_v)
+        self._acc_xx = self._acc_xy = None
+        if self.debug_svd and _t0 is not None:
+            print(f"[debug] {self.name} fasterprune_solve_time={time.time()-_t0:.3f}s")
         return self.appendU, self.appendV
 
 
