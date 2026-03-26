@@ -1398,12 +1398,26 @@ class local_update:
                 u_mat = updated_uT.t() if torch.isfinite(updated_uT).all() else best_uT.t()
                 rhs_r = self._acc_xy.matmul(u_mat)         # [r, r]
                 r_prior = torch.eye(self.rank, device=self.dev, dtype=rhs_r.dtype)
-                r_corr = self._solve_ridge_from_stats(
+                # NOTE:
+                #   minimize ||X R U^T - Y||_F^2
+                # yields   (X^T X) R (U^T U) = X^T Y U.
+                # The old implementation solved only the left system and implicitly
+                # assumed U^T U = I, which is no longer true after U-step update.
+                # We therefore solve both sides in sequence (regularized), which is
+                # a stable approximation to the full Sylvester system.
+                r_left = self._solve_ridge_from_stats(
                     self._acc_xx,
                     rhs_r,
                     ridge=self.bi_v_ridge,
-                    prior=r_prior,
+                    prior=None,
                 )
+                u_gram = u_mat.t().matmul(u_mat)
+                r_corr = self._solve_ridge_from_stats(
+                    u_gram.t(),
+                    r_left.t(),
+                    ridge=self.bi_v_ridge,
+                    prior=r_prior.t(),
+                ).t()
                 sigma = self.truc_sigma
                 sigma_floor = max(float(self.bi_sigma_eps), 1e-4 * float(self.truc_s.max().item()))
                 sigma_inv = torch.diag(1.0 / torch.clamp(self.truc_s, min=sigma_floor))
