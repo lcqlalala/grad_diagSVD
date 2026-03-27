@@ -2010,7 +2010,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
     return chosen_ratios
 
 
-def _obtain_module_ranks(args, model, profiling_mat):
+def _load_or_profile_spectrum(args, model, profiling_mat):
     spectrum_path = args.spectrum_path
     if spectrum_path is None and args.save_path is not None:
         spectrum_path = _default_spectrum_path(args.save_path, args.model, args.dataset, args.whitening_nsamples, args.seed)
@@ -2026,6 +2026,197 @@ def _obtain_module_ranks(args, model, profiling_mat):
         if spectrum_path is not None:
             meta = _spectrum_meta(args)
             torch.save({"meta": meta, "spectra": spectrum}, spectrum_path)
+    return spectrum
+
+
+def allocate_module_ranks_within_layer_budget(
+    spectra,
+    layer_ratios,
+    min_rank=1,
+    max_rank=None,
+    min_rank_overrides=None,
+    qkv_multiple=None,
+    early_layers=None,
+    early_layers_min_qkv=None,
+    eps=1e-12,
+):
+    if spectra is None or layer_ratios is None:
+        return None, 0.0
+
+    def _is_qkv(name):
+        return "q_proj" in name or "k_proj" in name or "v_proj" in name
+
+    def _ceil_multiple(val, step):
+        return int((val + step - 1) // step) * step
+
+    def _align_rank(k, step, k_max, cap=None):
+        if step is None or step <= 1:
+            if cap is not None:
+                k = min(k, cap)
+            return min(k, k_max)
+        if cap is not None:
+            k = min(k, cap)
+        k = min(k, k_max)
+        k = _ceil_multiple(k, step)
+        if k > k_max:
+            k = (k_max // step) * step
+        if cap is not None and k > cap:
+            k = (cap // step) * step
+        if k <= 0:
+            k = min(step, k_max)
+        return k
+
+    def _next_rank(k, step, k_max):
+        if step is None or step <= 1:
+            return min(k + 1, k_max)
+        return min(k + step, k_max)
+
+    def _block_score(s2, k, next_k, cost):
+        if s2.numel() == 0 or next_k <= k:
+            return 0.0
+        delta = next_k - k
+        block_sum = float(s2[k:next_k].sum().item())
+        return block_sum / max(1.0, float(delta * cost))
+
+    def _pick_min_rank(name, base):
+        if not min_rank_overrides:
+            return base
+        if "o_proj" in name or "out_proj" in name:
+            return min_rank_overrides.get("o_proj", base)
+        if "down_proj" in name:
+            return min_rank_overrides.get("down_proj", base)
+        if "q_proj" in name or "k_proj" in name or "v_proj" in name:
+            return min_rank_overrides.get("qkv", min_rank_overrides.get("attn", base))
+        if "gate_proj" in name or "up_proj" in name:
+            return min_rank_overrides.get("mlp", base)
+        return base
+
+    module_ranks = {}
+    total_full = 0
+    total_low = 0
+    for layer_id in sorted(spectra.keys()):
+        layer_spec = spectra[layer_id]
+        ratio_i = float(layer_ratios[layer_id]) if layer_id < len(layer_ratios) else float(layer_ratios[-1])
+        ratio_i = min(0.9999, max(1e-6, ratio_i))
+
+        entries = []
+        layer_full = 0
+        layer_budget = 0
+        layer_min_total = 0
+        for name, info in layer_spec.items():
+            m, n = info["shape"]
+            s2 = info["s2"]
+            k_max = int(min(m, n, s2.shape[0]))
+            if k_max <= 0:
+                continue
+            cost = int(m + n)
+            full = int(m * n)
+            layer_full += full
+            step = qkv_multiple if qkv_multiple and _is_qkv(name) else 1
+            base_min = min_rank if min_rank is not None else 1
+            r_min = int(_pick_min_rank(name, base_min))
+            if early_layers_min_qkv is not None and early_layers is not None:
+                if layer_id < early_layers and _is_qkv(name):
+                    r_min = max(r_min, int(early_layers_min_qkv))
+            r_min = max(1, min(r_min, k_max))
+            r_min = _align_rank(r_min, step, k_max, cap=max_rank)
+            entries.append({
+                "name": name,
+                "s2": s2,
+                "cost": cost,
+                "k_max": k_max,
+                "step": step,
+                "r_min": r_min,
+            })
+            layer_min_total += int(r_min * cost)
+
+        if layer_full <= 0:
+            continue
+        layer_budget = int(round(ratio_i * layer_full))
+        layer_budget = max(layer_min_total, layer_budget)
+        total_full += layer_full
+
+        ranks_i = {}
+        total_i = 0
+        for e in entries:
+            ranks_i[e["name"]] = int(e["r_min"])
+            total_i += int(e["r_min"] * e["cost"])
+
+        if total_i > layer_budget + eps:
+            print(
+                f"[modulewise] WARNING layer {layer_id:02d}: floor budget {total_i} > "
+                f"layer budget {layer_budget}, keep floor ranks."
+            )
+            module_ranks[layer_id] = ranks_i
+            total_low += total_i
+            continue
+
+        heap = []
+        for e in entries:
+            k = ranks_i[e["name"]]
+            if k < e["k_max"]:
+                nk = _next_rank(k, e["step"], e["k_max"])
+                score = _block_score(e["s2"], k, nk, e["cost"])
+                heapq.heappush(heap, (-score, e["name"]))
+
+        entry_map = {e["name"]: e for e in entries}
+        while heap and total_i + eps < layer_budget:
+            neg_score, name = heapq.heappop(heap)
+            e = entry_map[name]
+            k = ranks_i[name]
+            nk = _next_rank(k, e["step"], e["k_max"])
+            delta_k = nk - k
+            if delta_k <= 0:
+                continue
+            add_cost = int(delta_k * e["cost"])
+            if total_i + add_cost > layer_budget + eps:
+                continue
+            ranks_i[name] = nk
+            total_i += add_cost
+            if nk < e["k_max"]:
+                nnk = _next_rank(nk, e["step"], e["k_max"])
+                nscore = _block_score(e["s2"], nk, nnk, e["cost"])
+                heapq.heappush(heap, (-nscore, name))
+
+        module_ranks[layer_id] = ranks_i
+        total_low += total_i
+
+    effective = (total_low / max(total_full, 1)) if total_full > 0 else 0.0
+    return module_ranks, effective
+
+
+def _obtain_layer_budget_module_ranks(args, model, profiling_mat, layer_ratios):
+    spectrum = _load_or_profile_spectrum(args, model, profiling_mat)
+    qkv_multiple = _get_head_dim(model)
+    early_layers = args.early_layers if args.early_layers is not None and args.early_layers > 0 else None
+    module_ranks, effective_ratio = allocate_module_ranks_within_layer_budget(
+        spectrum,
+        layer_ratios,
+        min_rank=args.module_rank_min,
+        max_rank=args.module_rank_max,
+        min_rank_overrides=_module_rank_overrides(args),
+        qkv_multiple=qkv_multiple,
+        early_layers=early_layers,
+        early_layers_min_qkv=args.early_layers_min_qkv,
+    )
+    if args.print_layer_ratios and module_ranks is not None:
+        eff2, layer_stats = summarize_module_ranks(spectrum, module_ranks)
+        print(
+            f"[modulewise] layer-budget reallocation effective_ratio={eff2:.6f} "
+            f"(from layerwise targets)"
+        )
+        for layer_id in sorted(layer_stats.keys()):
+            print(f"[modulewise] layer {layer_id:02d} ratio={layer_stats[layer_id]:.6f}")
+    if args.print_module_ranks and module_ranks is not None:
+        for layer_id in sorted(module_ranks.keys()):
+            for name, k in module_ranks[layer_id].items():
+                shape = spectrum[layer_id][name]["shape"]
+                print(f"[modulewise] layer {layer_id:02d} {name} rank={k} shape={shape}")
+    return module_ranks
+
+
+def _obtain_module_ranks(args, model, profiling_mat):
+    spectrum = _load_or_profile_spectrum(args, model, profiling_mat)
     qkv_multiple = None
     if args.module_rank_min_qkv is not None or args.early_layers_min_qkv is not None:
         qkv_multiple = _get_head_dim(model)
@@ -2239,6 +2430,8 @@ if __name__ == '__main__':
         help='Minimum number of batches evaluated before early-stop can trigger.')
     parser.add_argument('--loss_aware_dp_bins', type=int, default=2000,
         help='DP budget bins for loss-aware layerwise allocation (larger = finer budget match, slower DP).')
+    parser.add_argument('--loss_aware_modulewise_refine', action='store_true',
+        help='After selecting layerwise ratios, reallocate ranks within each layer budget across modules by spectral cost-effectiveness.')
     parser.add_argument('--use_module_rank_allocation', action='store_true', help='Allocate per-module ranks via spectrum + Lagrange')
     parser.add_argument('--spectrum_path', type=str, default=None, help='Path to load/save module spectrum cache')
     parser.add_argument('--module_rank_min', type=int, default=1, help='Minimum rank per module')
@@ -2309,6 +2502,10 @@ if __name__ == '__main__':
                 cali_white_data=cali_white_data,
             )
             module_ranks = None
+            if args.loss_aware_modulewise_refine:
+                print("[loss-aware] refine layer budgets to module-wise ranks by spectral cost-effectiveness.")
+                module_ranks = _obtain_layer_budget_module_ranks(args, model, profiling_mat, layer_ratios)
+                layer_ratios = None
         elif args.use_layerwise_ratio:
             layer_ratios = _obtain_layer_ratios(args, model, None)
         if args.use_module_rank_allocation and not args.use_loss_aware_layerwise:
@@ -2354,6 +2551,10 @@ if __name__ == '__main__':
                 cali_white_data=cali_white_data,
             )
             module_ranks = None
+            if args.loss_aware_modulewise_refine:
+                print("[loss-aware] refine layer budgets to module-wise ranks by spectral cost-effectiveness.")
+                module_ranks = _obtain_layer_budget_module_ranks(args, model, profiling_mat, layer_ratios)
+                layer_ratios = None
         elif args.use_layerwise_ratio:
             layer_ratios = _obtain_layer_ratios(args, model, None)
         if args.use_module_rank_allocation and not args.use_loss_aware_layerwise:
@@ -2403,6 +2604,10 @@ if __name__ == '__main__':
                 cali_white_data=None,
             )
             module_ranks = None
+            if args.loss_aware_modulewise_refine:
+                print("[loss-aware] refine layer budgets to module-wise ranks by spectral cost-effectiveness.")
+                module_ranks = _obtain_layer_budget_module_ranks(args, model, None, layer_ratios)
+                layer_ratios = None
         elif args.use_layerwise_ratio:
             layer_ratios = _obtain_layer_ratios(args, model, None)
         if args.use_module_rank_allocation and not args.use_loss_aware_layerwise:
