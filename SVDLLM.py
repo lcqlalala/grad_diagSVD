@@ -1904,17 +1904,52 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                     "loss": float(loss_i),
                     "delta": float(loss_i - base_loss),
                 })
-            coarse_sorted = sorted(coarse_table, key=lambda x: x["delta"])
+            # Stage-1 coarse screen by cost-effectiveness instead of pure loss.
+            # score = loss_drop / param_increase (higher is better)
+            # where loss_drop uses marginal improvement between adjacent costs.
+            coarse_by_cost = sorted(coarse_table, key=lambda x: (x["cost"], x["ratio"]))
+            best_by_cost = {}
+            for item in coarse_by_cost:
+                c = int(item["cost"])
+                if c not in best_by_cost or item["delta"] < best_by_cost[c]["delta"]:
+                    best_by_cost[c] = item
+            unique_costs = sorted(best_by_cost.keys())
+            cost_eff = {}
+            if len(unique_costs) >= 2:
+                prev_c = unique_costs[0]
+                prev_d = float(best_by_cost[prev_c]["delta"])
+                for c in unique_costs[1:]:
+                    cur_d = float(best_by_cost[c]["delta"])
+                    dcost = max(1, int(c - prev_c))
+                    loss_drop = float(prev_d - cur_d)
+                    cost_eff[c] = loss_drop / float(dcost)
+                    prev_c, prev_d = c, cur_d
+            # assign each candidate its cost bucket score
+            for item in coarse_table:
+                item["stage1_score"] = float(cost_eff.get(int(item["cost"]), float("-inf")))
+
+            coarse_sorted = sorted(
+                coarse_table,
+                key=lambda x: (-(x["stage1_score"]), x["delta"], x["cost"])
+            )
             selected_ratios = {x["ratio"] for x in coarse_sorted[:stage1_topk]}
             selected_ratios.add(min(candidates))
             selected_ratios.add(max(candidates))
             selected_ratios.add(min(candidates, key=lambda r: abs(float(r) - float(args.ratio))))
             selected_candidates = sorted(selected_ratios)
-            coarse_delta_map = {x["ratio"]: x["delta"] for x in coarse_sorted}
-            eval_order = sorted(selected_candidates, key=lambda r: coarse_delta_map.get(float(r), float("inf")))
+            coarse_score_map = {x["ratio"]: x.get("stage1_score", float("-inf")) for x in coarse_table}
+            coarse_delta_map = {x["ratio"]: x["delta"] for x in coarse_table}
+            eval_order = sorted(
+                selected_candidates,
+                key=lambda r: (-coarse_score_map.get(float(r), float("-inf")), coarse_delta_map.get(float(r), float("inf")))
+            )
             if args.print_layer_ratios:
                 kept = ",".join([f"{x:.4f}" for x in selected_candidates])
                 print(f"[loss-aware] layer {li:02d} stage1 keep candidates: {kept}")
+                stage1_msg = "  ".join(
+                    [f"r={x['ratio']:.4f}:score={x.get('stage1_score', float('-inf')):+.3e}" for x in sorted(coarse_table, key=lambda y: y["ratio"])]
+                )
+                print(f"[loss-aware] layer {li:02d} stage1 score {stage1_msg}")
         else:
             selected_candidates = candidates
             eval_order = list(selected_candidates)
