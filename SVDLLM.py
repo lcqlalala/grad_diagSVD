@@ -2253,7 +2253,9 @@ def allocate_module_ranks_within_layer_budget(
 
 def _obtain_layer_budget_module_ranks(args, model, profiling_mat, layer_ratios):
     spectrum = _load_or_profile_spectrum(args, model, profiling_mat)
-    qkv_multiple = _get_head_dim(model)
+    qkv_multiple = None
+    if args.module_rank_min_qkv is not None or args.early_layers_min_qkv is not None:
+        qkv_multiple = _get_head_dim(model)
     early_layers = args.early_layers if args.early_layers is not None and args.early_layers > 0 else None
     module_ranks, effective_ratio = allocate_module_ranks_within_layer_budget(
         spectrum,
