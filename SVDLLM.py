@@ -2038,6 +2038,7 @@ def allocate_module_ranks_within_layer_budget(
     qkv_multiple=None,
     early_layers=None,
     early_layers_min_qkv=None,
+    print_layer_diff=False,
     eps=1e-12,
 ):
     if spectra is None or layer_ratios is None:
@@ -2071,6 +2072,11 @@ def allocate_module_ranks_within_layer_budget(
             return min(k + 1, k_max)
         return min(k + step, k_max)
 
+    def _prev_rank(k, step, r_min):
+        if step is None or step <= 1:
+            return max(r_min, k - 1)
+        return max(r_min, k - step)
+
     def _block_score(s2, k, next_k, cost):
         if s2.numel() == 0 or next_k <= k:
             return 0.0
@@ -2094,6 +2100,12 @@ def allocate_module_ranks_within_layer_budget(
     module_ranks = {}
     total_full = 0
     total_low = 0
+    def _module_name_order(name):
+        order = {
+            "q_proj": 0, "k_proj": 1, "v_proj": 2, "o_proj": 3, "out_proj": 3,
+            "gate_proj": 4, "up_proj": 5, "down_proj": 6, "fc1": 4, "fc2": 6,
+        }
+        return order.get(name, 99), name
     for layer_id in sorted(spectra.keys()):
         layer_spec = spectra[layer_id]
         ratio_i = float(layer_ratios[layer_id]) if layer_id < len(layer_ratios) else float(layer_ratios[-1])
@@ -2137,19 +2149,50 @@ def allocate_module_ranks_within_layer_budget(
         total_full += layer_full
 
         ranks_i = {}
+        base_ranks_i = {}
         total_i = 0
+        base_total_i = 0
+        entry_map = {e["name"]: e for e in entries}
         for e in entries:
-            ranks_i[e["name"]] = int(e["r_min"])
-            total_i += int(e["r_min"] * e["cost"])
+            # Start from the layer-ratio baseline rank for each module, then
+            # re-balance within the fixed layer budget. This avoids collapsing
+            # critical modules (e.g. o_proj/down_proj) to tiny ranks.
+            m, n = layer_spec[e["name"]]["shape"]
+            k0 = _rank_from_ratio(int(m), int(n), ratio_i, max_rank=max_rank)
+            k0 = max(e["r_min"], min(k0, e["k_max"]))
+            k0 = _align_rank(k0, e["step"], e["k_max"], cap=max_rank)
+            if k0 < e["r_min"]:
+                k0 = e["r_min"]
+            ranks_i[e["name"]] = int(k0)
+            base_ranks_i[e["name"]] = int(k0)
+            total_i += int(k0 * e["cost"])
+            base_total_i += int(k0 * e["cost"])
 
         if total_i > layer_budget + eps:
-            print(
-                f"[modulewise] WARNING layer {layer_id:02d}: floor budget {total_i} > "
-                f"layer budget {layer_budget}, keep floor ranks."
-            )
-            module_ranks[layer_id] = ranks_i
-            total_low += total_i
-            continue
+            # Remove ranks with the smallest loss increase per parameter first.
+            remove_heap = []
+            for e in entries:
+                k = ranks_i[e["name"]]
+                pk = _prev_rank(k, e["step"], e["r_min"])
+                if pk < k:
+                    penalty = _block_score(e["s2"], pk, k, e["cost"])
+                    heapq.heappush(remove_heap, (penalty, e["name"]))
+            while remove_heap and total_i > layer_budget + eps:
+                penalty, name = heapq.heappop(remove_heap)
+                e = entry_map[name]
+                k = ranks_i[name]
+                pk = _prev_rank(k, e["step"], e["r_min"])
+                if pk >= k:
+                    continue
+                delta_k = k - pk
+                sub_cost = int(delta_k * e["cost"])
+                ranks_i[name] = pk
+                total_i -= sub_cost
+                # still removable, push next block
+                pk2 = _prev_rank(pk, e["step"], e["r_min"])
+                if pk2 < pk:
+                    penalty2 = _block_score(e["s2"], pk2, pk, e["cost"])
+                    heapq.heappush(remove_heap, (penalty2, name))
 
         heap = []
         for e in entries:
@@ -2180,6 +2223,29 @@ def allocate_module_ranks_within_layer_budget(
 
         module_ranks[layer_id] = ranks_i
         total_low += total_i
+        if print_layer_diff:
+            changed = []
+            for name in ranks_i.keys():
+                kb = int(base_ranks_i.get(name, ranks_i[name]))
+                ka = int(ranks_i[name])
+                if kb != ka:
+                    e = entry_map[name]
+                    d_rank = ka - kb
+                    d_param = d_rank * int(e["cost"])
+                    changed.append((name, kb, ka, d_rank, d_param))
+            print(
+                f"[modulewise-diff] layer {layer_id:02d}: "
+                f"budget={layer_budget} base_cost={base_total_i} final_cost={total_i} "
+                f"changed={len(changed)}"
+            )
+            if changed:
+                for name, kb, ka, d_rank, d_param in sorted(changed, key=lambda x: _module_name_order(x[0])):
+                    print(
+                        f"[modulewise-diff] layer {layer_id:02d} {name}: "
+                        f"{kb} -> {ka} (Δk={d_rank:+d}, Δparam={d_param:+d})"
+                    )
+            else:
+                print(f"[modulewise-diff] layer {layer_id:02d}: no rank change from baseline.")
 
     effective = (total_low / max(total_full, 1)) if total_full > 0 else 0.0
     return module_ranks, effective
@@ -2198,6 +2264,7 @@ def _obtain_layer_budget_module_ranks(args, model, profiling_mat, layer_ratios):
         qkv_multiple=qkv_multiple,
         early_layers=early_layers,
         early_layers_min_qkv=args.early_layers_min_qkv,
+        print_layer_diff=True,
     )
     if args.print_layer_ratios and module_ranks is not None:
         eff2, layer_stats = summarize_module_ranks(spectrum, module_ranks)
