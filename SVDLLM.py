@@ -2072,7 +2072,9 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                 coarse_table,
                 key=lambda x: (-(x["stage1_score"]), x["delta"], x["cost"])
             )
+            coarse_best_loss = sorted(coarse_table, key=lambda x: (x["delta"], x["cost"]))
             selected_ratios = {x["ratio"] for x in coarse_sorted[:stage1_topk]}
+            selected_ratios.update({x["ratio"] for x in coarse_best_loss[:stage1_topk]})
             selected_ratios.add(min(candidates))
             selected_ratios.add(max(candidates))
             selected_ratios.add(min(candidates, key=lambda r: abs(float(r) - float(args.ratio))))
@@ -2744,6 +2746,15 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
+    if args.step == 1:
+        if args.updating_nsamples != 16 or args.update_layer_batch_size != 1:
+            print("[step1] NOTE: --updating_nsamples/--update_layer_batch_size are not used in step 1.")
+        if any([
+            abs(float(args.bi_u_ridge) - 1e-5) > 0.0,
+            abs(float(args.bi_v_ridge) - 1e-5) > 0.0,
+            abs(float(args.bi_sigma_eps) - 1e-6) > 0.0,
+        ]):
+            print("[step1] NOTE: --bi_u_ridge/--bi_v_ridge/--bi_sigma_eps are only used in step 2/3 local update.")
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
