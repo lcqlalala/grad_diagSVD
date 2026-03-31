@@ -2075,8 +2075,9 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             coarse_best_loss = sorted(coarse_table, key=lambda x: (x["delta"], x["cost"]))
             selected_ratios = {x["ratio"] for x in coarse_sorted[:stage1_topk]}
             selected_ratios.update({x["ratio"] for x in coarse_best_loss[:stage1_topk]})
-            selected_ratios.add(min(candidates))
-            selected_ratios.add(max(candidates))
+            if args.loss_aware_include_bounds:
+                selected_ratios.add(min(candidates))
+                selected_ratios.add(max(candidates))
             selected_ratios.add(min(candidates, key=lambda r: abs(float(r) - float(args.ratio))))
             selected_candidates = sorted(selected_ratios)
             coarse_score_map = {x["ratio"]: x.get("stage1_score", float("-inf")) for x in coarse_table}
@@ -2367,8 +2368,6 @@ def allocate_module_ranks_within_layer_budget(
                 nscore = _block_score(e["s2"], nk, nnk, e["cost"])
                 heapq.heappush(heap, (-nscore, name))
 
-        module_ranks[layer_id] = ranks_i
-        total_low += total_i
         # Spectral loss proxy: normalized tail energy sum after truncation.
         layer_energy = 0.0
         layer_proxy_before = 0.0
@@ -2383,9 +2382,28 @@ def allocate_module_ranks_within_layer_budget(
             layer_energy += en
             layer_proxy_before += tail_b
             layer_proxy_after += tail_a
+
+        # Safety gate: if refine hurts proxy and baseline already fits layer budget,
+        # rollback to baseline ranks for this layer.
+        proxy_before_norm = (layer_proxy_before / max(layer_energy, eps)) if layer_energy > 0 else 0.0
+        proxy_after_norm = (layer_proxy_after / max(layer_energy, eps)) if layer_energy > 0 else 0.0
+        if (base_total_i <= layer_budget + eps) and (proxy_after_norm > proxy_before_norm * (1.0 + 1e-4)):
+            if print_layer_diff:
+                pct = (proxy_after_norm - proxy_before_norm) / max(proxy_before_norm, eps) * 100.0
+                print(
+                    f"[modulewise-diff] layer {layer_id:02d}: rollback to baseline "
+                    f"(proxy worsened by {pct:+.3f}%)."
+                )
+            ranks_i = dict(base_ranks_i)
+            total_i = int(base_total_i)
+            layer_proxy_after = layer_proxy_before
+            proxy_after_norm = proxy_before_norm
+
+        module_ranks[layer_id] = ranks_i
+        total_low += total_i
         proxy_layers[layer_id] = {
-            "before": (layer_proxy_before / max(layer_energy, eps)) if layer_energy > 0 else 0.0,
-            "after": (layer_proxy_after / max(layer_energy, eps)) if layer_energy > 0 else 0.0,
+            "before": proxy_before_norm,
+            "after": proxy_after_norm,
             "energy": layer_energy,
             "before_raw": layer_proxy_before,
             "after_raw": layer_proxy_after,
