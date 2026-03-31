@@ -2182,7 +2182,7 @@ def allocate_module_ranks_within_layer_budget(
     eps=1e-12,
 ):
     if spectra is None or layer_ratios is None:
-        return None, 0.0
+        return None, 0.0, None
 
     def _is_qkv(name):
         return "q_proj" in name or "k_proj" in name or "v_proj" in name
@@ -2240,6 +2240,10 @@ def allocate_module_ranks_within_layer_budget(
     module_ranks = {}
     total_full = 0
     total_low = 0
+    proxy_layers = {}
+    proxy_before_total = 0.0
+    proxy_after_total = 0.0
+    proxy_energy_total = 0.0
     def _module_name_order(name):
         order = {
             "q_proj": 0, "k_proj": 1, "v_proj": 2, "o_proj": 3, "out_proj": 3,
@@ -2363,6 +2367,30 @@ def allocate_module_ranks_within_layer_budget(
 
         module_ranks[layer_id] = ranks_i
         total_low += total_i
+        # Spectral loss proxy: normalized tail energy sum after truncation.
+        layer_energy = 0.0
+        layer_proxy_before = 0.0
+        layer_proxy_after = 0.0
+        for name, e in entry_map.items():
+            s2 = e["s2"]
+            kb = int(base_ranks_i.get(name, ranks_i[name]))
+            ka = int(ranks_i[name])
+            en = float(s2.sum().item())
+            tail_b = float(s2[kb:].sum().item()) if kb < int(s2.shape[0]) else 0.0
+            tail_a = float(s2[ka:].sum().item()) if ka < int(s2.shape[0]) else 0.0
+            layer_energy += en
+            layer_proxy_before += tail_b
+            layer_proxy_after += tail_a
+        proxy_layers[layer_id] = {
+            "before": (layer_proxy_before / max(layer_energy, eps)) if layer_energy > 0 else 0.0,
+            "after": (layer_proxy_after / max(layer_energy, eps)) if layer_energy > 0 else 0.0,
+            "energy": layer_energy,
+            "before_raw": layer_proxy_before,
+            "after_raw": layer_proxy_after,
+        }
+        proxy_before_total += layer_proxy_before
+        proxy_after_total += layer_proxy_after
+        proxy_energy_total += layer_energy
         if print_layer_diff:
             changed = []
             for name in ranks_i.keys():
@@ -2388,7 +2416,15 @@ def allocate_module_ranks_within_layer_budget(
                 print(f"[modulewise-diff] layer {layer_id:02d}: no rank change from baseline.")
 
     effective = (total_low / max(total_full, 1)) if total_full > 0 else 0.0
-    return module_ranks, effective
+    proxy_summary = {
+        "layers": proxy_layers,
+        "overall_before": (proxy_before_total / max(proxy_energy_total, eps)) if proxy_energy_total > 0 else 0.0,
+        "overall_after": (proxy_after_total / max(proxy_energy_total, eps)) if proxy_energy_total > 0 else 0.0,
+        "overall_before_raw": proxy_before_total,
+        "overall_after_raw": proxy_after_total,
+        "overall_energy": proxy_energy_total,
+    }
+    return module_ranks, effective, proxy_summary
 
 
 def _obtain_layer_budget_module_ranks(args, model, profiling_mat, layer_ratios):
@@ -2397,7 +2433,7 @@ def _obtain_layer_budget_module_ranks(args, model, profiling_mat, layer_ratios):
     if args.module_rank_min_qkv is not None or args.early_layers_min_qkv is not None:
         qkv_multiple = _get_head_dim(model)
     early_layers = args.early_layers if args.early_layers is not None and args.early_layers > 0 else None
-    module_ranks, effective_ratio = allocate_module_ranks_within_layer_budget(
+    module_ranks, effective_ratio, proxy_summary = allocate_module_ranks_within_layer_budget(
         spectrum,
         layer_ratios,
         min_rank=args.module_rank_min,
@@ -2408,6 +2444,27 @@ def _obtain_layer_budget_module_ranks(args, model, profiling_mat, layer_ratios):
         early_layers_min_qkv=args.early_layers_min_qkv,
         print_layer_diff=True,
     )
+    if int(getattr(args, "step", -1)) == 1 and proxy_summary is not None:
+        ob = float(proxy_summary["overall_before"])
+        oa = float(proxy_summary["overall_after"])
+        od = oa - ob
+        print(
+            f"[modulewise-proxy] overall spectral-tail proxy: "
+            f"before={ob:.6f} after={oa:.6f} delta={od:+.6f} ({(od/max(ob,1e-12))*100:+.2f}%)"
+        )
+        layer_items = []
+        for lid, st in proxy_summary["layers"].items():
+            d = float(st["after"] - st["before"])
+            layer_items.append((lid, st, d))
+        # Print worst regressions first for fast debugging.
+        layer_items.sort(key=lambda x: x[2], reverse=True)
+        for lid, st, d in layer_items:
+            pct = (d / max(float(st["before"]), 1e-12)) * 100.0
+            print(
+                f"[modulewise-proxy] layer {int(lid):02d}: "
+                f"before={float(st['before']):.6f} after={float(st['after']):.6f} "
+                f"delta={d:+.6f} ({pct:+.2f}%)"
+            )
     if args.print_layer_ratios and module_ranks is not None:
         eff2, layer_stats = summarize_module_ranks(spectrum, module_ranks)
         print(
