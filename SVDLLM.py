@@ -1872,19 +1872,159 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         layer_full_sizes.append(layer_full)
 
         table = []
+        min_rank_overrides = _module_rank_overrides(args)
+        qkv_multiple_local = None
+        if args.module_rank_min_qkv is not None or args.early_layers_min_qkv is not None:
+            qkv_multiple_local = _get_head_dim(model)
+        early_layers = args.early_layers if args.early_layers is not None and args.early_layers > 0 else None
+
+        def _is_qkv_name(name):
+            return "q_proj" in name or "k_proj" in name or "v_proj" in name
+
+        def _pick_min_rank_local(name, base):
+            if not min_rank_overrides:
+                return base
+            if "o_proj" in name or "out_proj" in name:
+                return min_rank_overrides.get("o_proj", base)
+            if "down_proj" in name:
+                return min_rank_overrides.get("down_proj", base)
+            if _is_qkv_name(name):
+                return min_rank_overrides.get("qkv", min_rank_overrides.get("attn", base))
+            if "gate_proj" in name or "up_proj" in name:
+                return min_rank_overrides.get("mlp", base)
+            return base
+
+        def _align_rank_local(k, step, k_max):
+            if step is None or step <= 1:
+                return min(max(1, int(k)), int(k_max))
+            k = min(max(1, int(k)), int(k_max))
+            k = int(math.ceil(k / step) * step)
+            if k > k_max:
+                k = (k_max // step) * step
+            if k <= 0:
+                k = min(step, k_max)
+            return int(k)
+
+        def _next_rank_local(k, step, k_max):
+            if step is None or step <= 1:
+                return min(int(k) + 1, int(k_max))
+            return min(int(k) + int(step), int(k_max))
+
+        def _prev_rank_local(k, step, r_min):
+            if step is None or step <= 1:
+                return max(int(r_min), int(k) - 1)
+            return max(int(r_min), int(k) - int(step))
+
+        def _block_score_local(s2, k0, k1, cost):
+            if k1 <= k0:
+                return 0.0
+            delta = int(k1 - k0)
+            block_sum = float(s2[k0:k1].sum().item())
+            return block_sum / max(1.0, float(delta * cost))
+
+        def _allocate_layer_module_ranks_for_ratio(ratio_i):
+            ratio_i = float(ratio_i)
+            entries = []
+            layer_budget = int(round(ratio_i * layer_full))
+            for name, info in layer_cache.items():
+                m, n = int(info["m"]), int(info["n"])
+                cost = int(m + n)
+                s2 = (info["S"].float() ** 2).cpu()
+                k_cap = int(info["k_cap"])
+                step = qkv_multiple_local if (qkv_multiple_local and _is_qkv_name(name)) else 1
+                base_min = int(args.module_rank_min) if args.module_rank_min is not None else 1
+                r_min = int(_pick_min_rank_local(name, base_min))
+                if early_layers is not None and args.early_layers_min_qkv is not None and li < early_layers and _is_qkv_name(name):
+                    r_min = max(r_min, int(args.early_layers_min_qkv))
+                r_min = _align_rank_local(max(1, min(r_min, k_cap)), step, k_cap)
+                k0 = _rank_from_ratio(m, n, ratio_i, max_rank=args.module_rank_max)
+                k0 = max(r_min, min(k0, k_cap))
+                k0 = _align_rank_local(k0, step, k_cap)
+                entries.append({
+                    "name": name,
+                    "cost": cost,
+                    "s2": s2,
+                    "k_cap": k_cap,
+                    "step": step,
+                    "r_min": r_min,
+                    "k": int(k0),
+                })
+
+            rank_map = {e["name"]: int(e["k"]) for e in entries}
+            total_cost = sum(rank_map[e["name"]] * e["cost"] for e in entries)
+
+            if total_cost > layer_budget:
+                remove_heap = []
+                entry_map = {e["name"]: e for e in entries}
+                for e in entries:
+                    k = rank_map[e["name"]]
+                    pk = _prev_rank_local(k, e["step"], e["r_min"])
+                    if pk < k:
+                        penalty = _block_score_local(e["s2"], pk, k, e["cost"])
+                        heapq.heappush(remove_heap, (penalty, e["name"]))
+                while remove_heap and total_cost > layer_budget:
+                    _, name = heapq.heappop(remove_heap)
+                    e = entry_map[name]
+                    k = rank_map[name]
+                    pk = _prev_rank_local(k, e["step"], e["r_min"])
+                    if pk >= k:
+                        continue
+                    delta_k = int(k - pk)
+                    total_cost -= int(delta_k * e["cost"])
+                    rank_map[name] = int(pk)
+                    pk2 = _prev_rank_local(pk, e["step"], e["r_min"])
+                    if pk2 < pk:
+                        penalty2 = _block_score_local(e["s2"], pk2, pk, e["cost"])
+                        heapq.heappush(remove_heap, (penalty2, name))
+            elif total_cost < layer_budget:
+                add_heap = []
+                entry_map = {e["name"]: e for e in entries}
+                for e in entries:
+                    k = rank_map[e["name"]]
+                    if k < e["k_cap"]:
+                        nk = _next_rank_local(k, e["step"], e["k_cap"])
+                        score = _block_score_local(e["s2"], k, nk, e["cost"])
+                        heapq.heappush(add_heap, (-score, e["name"]))
+                while add_heap and total_cost < layer_budget:
+                    _, name = heapq.heappop(add_heap)
+                    e = entry_map[name]
+                    k = rank_map[name]
+                    nk = _next_rank_local(k, e["step"], e["k_cap"])
+                    if nk <= k:
+                        continue
+                    delta_k = int(nk - k)
+                    add_cost = int(delta_k * e["cost"])
+                    if total_cost + add_cost > layer_budget:
+                        continue
+                    rank_map[name] = int(nk)
+                    total_cost += add_cost
+                    if nk < e["k_cap"]:
+                        nnk = _next_rank_local(nk, e["step"], e["k_cap"])
+                        nscore = _block_score_local(e["s2"], nk, nnk, e["cost"])
+                        heapq.heappush(add_heap, (-nscore, name))
+
+            return rank_map, int(total_cost)
 
         def _apply_ratio(ratio_i):
-            cost_i = 0
+            if args.loss_aware_modulewise_refine:
+                rank_map, cost_i = _allocate_layer_module_ranks_for_ratio(ratio_i)
+            else:
+                rank_map = {}
+                cost_i = 0
+                for name, mod in subset.items():
+                    info = layer_cache[name]
+                    rank_k = _rank_from_ratio(info["m"], info["n"], ratio_i, max_rank=args.module_rank_max)
+                    rank_k = max(1, min(rank_k, info["k_cap"]))
+                    rank_map[name] = int(rank_k)
+                    cost_i += int(rank_k * (info["m"] + info["n"]))
             for name, mod in subset.items():
                 info = layer_cache[name]
-                rank_k = _rank_from_ratio(info["m"], info["n"], ratio_i, max_rank=args.module_rank_max)
-                rank_k = max(1, min(rank_k, info["k_cap"]))
+                rank_k = int(rank_map[name])
                 U = info["U"][:, :rank_k]
                 S = info["S"][:rank_k]
                 V = info["V"][:rank_k, :]
                 w_hat = torch.matmul(U * S.unsqueeze(0), V)
                 mod.weight.data.copy_(w_hat.to(mod.weight.device, dtype=mod.weight.dtype))
-                cost_i += int(rank_k * (info["m"] + info["n"]))
             return cost_i
 
         if use_two_stage:
