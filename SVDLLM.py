@@ -1677,14 +1677,7 @@ def _loss_aware_candidate_ratios(args):
     return sorted({round(v, 8) for v in vals})
 
 
-def _solve_layerwise_mckp(
-    layer_tables,
-    budget_params,
-    total_full,
-    dp_bins=2000,
-    objective_key="delta",
-    smooth_lambda=0.0,
-):
+def _solve_layerwise_mckp(layer_tables, budget_params, total_full, dp_bins=2000):
     n_layers = len(layer_tables)
     if n_layers == 0:
         return [], 0.0
@@ -1699,9 +1692,7 @@ def _solve_layerwise_mckp(
         items = []
         for ci, entry in enumerate(table):
             cb = max(1, int(math.ceil(entry["cost"] / bin_size)))
-            obj = float(entry.get(objective_key, entry["delta"]))
-            ratio = float(entry.get("ratio", 0.0))
-            items.append((ci, cb, obj, ratio))
+            items.append((ci, cb, float(entry["delta"])))
         min_bin_sum += min(x[1] for x in items)
         max_bin_sum += max(x[1] for x in items)
         layer_bins.append(items)
@@ -1716,122 +1707,44 @@ def _solve_layerwise_mckp(
         return chosen, cost / max(total_full, 1)
 
     inf = float("inf")
-    smooth_lambda = float(max(0.0, smooth_lambda))
-    if smooth_lambda <= 0.0:
-        prev = [inf] * (budget_bin + 1)
-        prev[0] = 0.0
-        trace = []
-        for li in range(n_layers):
-            curr = [inf] * (budget_bin + 1)
-            back = [(-1, -1)] * (budget_bin + 1)
-            for bprev in range(budget_bin + 1):
-                if prev[bprev] == inf:
-                    continue
-                base = prev[bprev]
-                for ci, cb, obj, _ratio in layer_bins[li]:
-                    b = bprev + cb
-                    if b > budget_bin:
-                        continue
-                    cand = base + obj
-                    if cand < curr[b]:
-                        curr[b] = cand
-                        back[b] = (bprev, ci)
-            prev = curr
-            trace.append(back)
-
-        feasible = [b for b, v in enumerate(prev) if v < inf]
-        if not feasible:
-            chosen = [min(range(len(t)), key=lambda i: t[i]["cost"]) for t in layer_tables]
-            cost = sum(layer_tables[i][chosen[i]]["cost"] for i in range(n_layers))
-            return chosen, cost / max(total_full, 1)
-        best_b = min(feasible, key=lambda b: (prev[b], -b))
-
-        chosen = [0] * n_layers
-        b = best_b
-        for li in range(n_layers - 1, -1, -1):
-            bprev, ci = trace[li][b]
-            if bprev < 0 or ci < 0:
-                chosen[li] = min(range(len(layer_tables[li])), key=lambda i: layer_tables[li][i]["cost"])
-                b = max(b, 0)
-            else:
-                chosen[li] = ci
-                b = bprev
-        cost = sum(layer_tables[i][chosen[i]]["cost"] for i in range(n_layers))
-        return chosen, cost / max(total_full, 1)
-
-    # Regularized DP with adjacent-layer smoothness.
-    first_items = layer_bins[0]
-    n0 = len(first_items)
-    prev = [[inf] * n0 for _ in range(budget_bin + 1)]
-    for ci, cb, obj, _r in first_items:
-        if cb <= budget_bin and obj < prev[cb][ci]:
-            prev[cb][ci] = obj
-    traces = []
-    for li in range(1, n_layers):
-        curr_items = layer_bins[li]
-        prev_items = layer_bins[li - 1]
-        n_prev = len(prev_items)
-        n_curr = len(curr_items)
-        curr = [[inf] * n_curr for _ in range(budget_bin + 1)]
-        back_b = [[-1] * n_curr for _ in range(budget_bin + 1)]
-        back_ci = [[-1] * n_curr for _ in range(budget_bin + 1)]
+    prev = [inf] * (budget_bin + 1)
+    prev[0] = 0.0
+    trace = []
+    for li in range(n_layers):
+        curr = [inf] * (budget_bin + 1)
+        back = [(-1, -1)] * (budget_bin + 1)
         for bprev in range(budget_bin + 1):
-            row = prev[bprev]
-            if all(v == inf for v in row):
+            if prev[bprev] == inf:
                 continue
-            for cprev in range(n_prev):
-                base = row[cprev]
-                if base == inf:
+            base = prev[bprev]
+            for ci, cb, delta in layer_bins[li]:
+                b = bprev + cb
+                if b > budget_bin:
                     continue
-                r_prev = float(prev_items[cprev][3])
-                for ci, cb, obj, r_cur in curr_items:
-                    b = bprev + cb
-                    if b > budget_bin:
-                        continue
-                    smooth_pen = smooth_lambda * abs(float(r_cur) - r_prev)
-                    cand = base + obj + smooth_pen
-                    if cand < curr[b][ci]:
-                        curr[b][ci] = cand
-                        back_b[b][ci] = bprev
-                        back_ci[b][ci] = cprev
-        traces.append((back_b, back_ci))
+                cand = base + delta
+                if cand < curr[b]:
+                    curr[b] = cand
+                    back[b] = (bprev, ci)
         prev = curr
+        trace.append(back)
 
-    best_val = inf
-    best_b = -1
-    best_ci = -1
-    last_items = layer_bins[-1]
-    for b in range(budget_bin + 1):
-        row = prev[b]
-        for ci in range(len(last_items)):
-            v = row[ci]
-            if v == inf:
-                continue
-            if (v < best_val) or (v == best_val and b > best_b):
-                best_val = v
-                best_b = b
-                best_ci = ci
-
-    if best_b < 0 or best_ci < 0:
+    feasible = [b for b, v in enumerate(prev) if v < inf]
+    if not feasible:
         chosen = [min(range(len(t)), key=lambda i: t[i]["cost"]) for t in layer_tables]
         cost = sum(layer_tables[i][chosen[i]]["cost"] for i in range(n_layers))
         return chosen, cost / max(total_full, 1)
+    best_b = min(feasible, key=lambda b: (prev[b], -b))
 
     chosen = [0] * n_layers
-    chosen[-1] = int(layer_bins[-1][best_ci][0])
     b = best_b
-    ci = best_ci
-    for li in range(n_layers - 1, 0, -1):
-        back_b, back_ci = traces[li - 1]
-        pb = int(back_b[b][ci])
-        pci = int(back_ci[b][ci])
-        if pb < 0 or pci < 0:
-            chosen[li - 1] = min(range(len(layer_tables[li - 1])), key=lambda i: layer_tables[li - 1][i]["cost"])
-            # keep (b,ci) unchanged for robustness fallback
+    for li in range(n_layers - 1, -1, -1):
+        bprev, ci = trace[li][b]
+        if bprev < 0 or ci < 0:
+            chosen[li] = min(range(len(layer_tables[li])), key=lambda i: layer_tables[li][i]["cost"])
+            b = max(b, 0)
         else:
-            chosen[li - 1] = int(layer_bins[li - 1][pci][0])
-            b = pb
-            ci = pci
+            chosen[li] = ci
+            b = bprev
     cost = sum(layer_tables[i][chosen[i]]["cost"] for i in range(n_layers))
     return chosen, cost / max(total_full, 1)
 
@@ -2102,25 +2015,12 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
 
     candidates = _loss_aware_candidate_ratios(args)
     print(f"[loss-aware] ratio candidates: {', '.join(f'{r:.4f}' for r in candidates)}")
-    low_ratio_penalty = float(max(0.0, getattr(args, "loss_aware_low_ratio_penalty", 0.0)))
-    low_ratio_power = float(max(1.0, getattr(args, "loss_aware_low_ratio_power", 2.0)))
-    low_ratio_anchor = float(getattr(args, "loss_aware_low_ratio_anchor", 0.0))
-    if low_ratio_anchor <= 0:
-        low_ratio_anchor = float(min(candidates))
-    smooth_lambda = float(max(0.0, getattr(args, "loss_aware_smooth_lambda", 0.0)))
     use_two_stage = bool(args.loss_aware_two_stage and len(candidates) > stage1_topk)
     if use_two_stage:
         print(
             f"[loss-aware] two-stage enabled: stage1_batches={stage1_batches}, "
             f"stage1_topk={stage1_topk}, full_batches={eval_batches}"
         )
-    if low_ratio_penalty > 0:
-        print(
-            f"[loss-aware] low-ratio penalty enabled: lambda={low_ratio_penalty:.6f}, "
-            f"anchor={low_ratio_anchor:.4f}, power={low_ratio_power:.2f}"
-        )
-    if smooth_lambda > 0:
-        print(f"[loss-aware] DP smoothness enabled: lambda={smooth_lambda:.6f}")
     if use_autocast_bf16:
         print("[loss-aware] eval autocast: bfloat16")
     if use_early_stop:
@@ -2467,16 +2367,11 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             )
             layer_best_loss = min(layer_best_loss, loss_i)
             delta_i = loss_i - base_loss
-            low_pen = 0.0
-            if low_ratio_penalty > 0:
-                low_pen = low_ratio_penalty * (max(0.0, float(low_ratio_anchor) - float(ratio_i)) ** low_ratio_power)
             table.append({
                 "ratio": float(ratio_i),
                 "cost": int(cost_i),
                 "loss": float(loss_i),
                 "delta": float(delta_i),
-                "low_penalty": float(low_pen),
-                "obj": float(delta_i + low_pen),
             })
         table.sort(key=lambda x: x["ratio"])
         for name, mod in subset.items():
@@ -2484,16 +2379,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         layer_cache.clear()
         layer_tables.append(table)
         if args.print_layer_ratios:
-            if low_ratio_penalty > 0:
-                msg = "  ".join(
-                    [
-                        f"r={x['ratio']:.4f}:Δ={x['delta']:+.5f}"
-                        f"(pen={x['low_penalty']:+.5f},obj={x['obj']:+.5f})"
-                        for x in table
-                    ]
-                )
-            else:
-                msg = "  ".join([f"r={x['ratio']:.4f}:Δ={x['delta']:+.5f}" for x in table])
+            msg = "  ".join([f"r={x['ratio']:.4f}:Δ={x['delta']:+.5f}" for x in table])
             print(f"[loss-aware] layer {li:02d} {msg}")
 
     total_full = sum(layer_full_sizes)
@@ -2503,8 +2389,6 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         target_params,
         total_full,
         dp_bins=args.loss_aware_dp_bins,
-        objective_key="obj" if (low_ratio_penalty > 0) else "delta",
-        smooth_lambda=smooth_lambda,
     )
     chosen_idx = _loss_aware_context_greedy_repair(
         args,
@@ -2519,23 +2403,13 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
     chosen_ratios = [layer_tables[i][chosen_idx[i]]["ratio"] for i in range(len(layer_tables))]
     chosen_cost = sum(layer_tables[i][chosen_idx[i]]["cost"] for i in range(len(layer_tables)))
     chosen_delta = sum(layer_tables[i][chosen_idx[i]]["delta"] for i in range(len(layer_tables)))
-    chosen_obj = sum(layer_tables[i][chosen_idx[i]].get("obj", layer_tables[i][chosen_idx[i]]["delta"]) for i in range(len(layer_tables)))
     print(f"[loss-aware] selected effective_ratio={chosen_cost/max(total_full,1):.6f} "
           f"(target={args.ratio:.6f})  total_delta={chosen_delta:+.6f}")
-    if low_ratio_penalty > 0 or smooth_lambda > 0:
-        print(f"[loss-aware] selected objective(total_obj)={chosen_obj:+.6f}")
     if args.print_layer_ratios:
         for li, ratio_i in enumerate(chosen_ratios):
             info = layer_tables[li][chosen_idx[li]]
-            if low_ratio_penalty > 0:
-                print(
-                    f"[loss-aware] layer {li:02d} ratio={ratio_i:.6f} "
-                    f"cost={info['cost']} delta={info['delta']:+.6f} "
-                    f"pen={info.get('low_penalty',0.0):+.6f} obj={info.get('obj', info['delta']):+.6f}"
-                )
-            else:
-                print(f"[loss-aware] layer {li:02d} ratio={ratio_i:.6f} "
-                      f"cost={info['cost']} delta={info['delta']:+.6f}")
+            print(f"[loss-aware] layer {li:02d} ratio={ratio_i:.6f} "
+                  f"cost={info['cost']} delta={info['delta']:+.6f}")
 
     if str(prev_device) == "cpu":
         model = model.cpu()
@@ -3105,14 +2979,6 @@ if __name__ == '__main__':
         help='Minimum number of batches evaluated before early-stop can trigger.')
     parser.add_argument('--loss_aware_dp_bins', type=int, default=2000,
         help='DP budget bins for loss-aware layerwise allocation (larger = finer budget match, slower DP).')
-    parser.add_argument('--loss_aware_low_ratio_penalty', type=float, default=0.0,
-        help='Penalty coefficient for very low per-layer keep ratios in DP objective.')
-    parser.add_argument('--loss_aware_low_ratio_anchor', type=float, default=0.0,
-        help='Anchor ratio for low-ratio penalty; <=0 means using min(candidates).')
-    parser.add_argument('--loss_aware_low_ratio_power', type=float, default=2.0,
-        help='Power used in low-ratio penalty: lambda * max(0, anchor-r)^power.')
-    parser.add_argument('--loss_aware_smooth_lambda', type=float, default=0.0,
-        help='Adjacent-layer smoothness penalty coefficient in DP objective.')
     parser.add_argument('--loss_aware_context_greedy_repair', action='store_true',
         help='After DP, run one-step greedy repair under compressed-context proxy (budget-aware).')
     parser.add_argument('--loss_aware_context_batches', type=int, default=4,
