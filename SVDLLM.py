@@ -2044,29 +2044,73 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                     "loss": float(loss_i),
                     "delta": float(loss_i - base_loss),
                 })
-            # Stage-1 coarse screen by cost-effectiveness instead of pure loss.
-            # score = loss_drop / param_increase (higher is better)
-            # where loss_drop uses marginal improvement between adjacent costs.
+            # Stage-1 coarse screen by Pareto + cost-effectiveness.
+            # Previous implementation gave the minimum-cost bucket no predecessor,
+            # thus assigning -inf and frequently filtering out low-ratio options.
+            # Here we:
+            # 1) build a cost-delta Pareto front (min cost, min loss increase),
+            # 2) score candidates by marginal loss-drop / param-increase,
+            # 3) always keep the low-ratio anchor for downstream DP flexibility.
             coarse_by_cost = sorted(coarse_table, key=lambda x: (x["cost"], x["ratio"]))
             best_by_cost = {}
             for item in coarse_by_cost:
                 c = int(item["cost"])
-                if c not in best_by_cost or item["delta"] < best_by_cost[c]["delta"]:
+                if c not in best_by_cost or float(item["delta"]) < float(best_by_cost[c]["delta"]):
                     best_by_cost[c] = item
-            unique_costs = sorted(best_by_cost.keys())
-            cost_eff = {}
-            if len(unique_costs) >= 2:
-                prev_c = unique_costs[0]
-                prev_d = float(best_by_cost[prev_c]["delta"])
-                for c in unique_costs[1:]:
-                    cur_d = float(best_by_cost[c]["delta"])
-                    dcost = max(1, int(c - prev_c))
-                    loss_drop = float(prev_d - cur_d)
-                    cost_eff[c] = loss_drop / float(dcost)
-                    prev_c, prev_d = c, cur_d
-            # assign each candidate its cost bucket score
+            pareto_input = [best_by_cost[c] for c in sorted(best_by_cost.keys())]
+            pareto_front = []
+            best_delta_so_far = float("inf")
+            for item in pareto_input:
+                d = float(item["delta"])
+                # keep strictly improving points in (cost, delta) space
+                if d < best_delta_so_far - 1e-12:
+                    pareto_front.append(item)
+                    best_delta_so_far = d
+            if not pareto_front:
+                pareto_front = pareto_input[:1]
+
+            # Finite stage1 scores for all candidates (no -inf bucket artifact).
+            score_by_cost = {}
+            if len(pareto_front) == 1:
+                score_by_cost[int(pareto_front[0]["cost"])] = 0.0
+            else:
+                for pi, p in enumerate(pareto_front):
+                    c = int(p["cost"])
+                    d = float(p["delta"])
+                    slopes = []
+                    if pi > 0:
+                        pl = pareto_front[pi - 1]
+                        dc = max(1, int(c - int(pl["cost"])))
+                        slopes.append((float(pl["delta"]) - d) / float(dc))
+                    if pi + 1 < len(pareto_front):
+                        pr = pareto_front[pi + 1]
+                        dc = max(1, int(int(pr["cost"]) - c))
+                        slopes.append((d - float(pr["delta"])) / float(dc))
+                    score_by_cost[c] = max(slopes) if slopes else 0.0
+
+            front_costs = [int(x["cost"]) for x in pareto_front]
+            front_by_cost = {int(x["cost"]): x for x in pareto_front}
             for item in coarse_table:
-                item["stage1_score"] = float(cost_eff.get(int(item["cost"]), float("-inf")))
+                c = int(item["cost"])
+                d = float(item["delta"])
+                if c in score_by_cost:
+                    score = float(score_by_cost[c])
+                else:
+                    # If not on Pareto front, score by efficiency vs nearest cheaper
+                    # Pareto anchor (still finite).
+                    left = None
+                    for fc in front_costs:
+                        if fc <= c:
+                            left = fc
+                        else:
+                            break
+                    if left is None:
+                        score = 0.0
+                    else:
+                        ref_d = float(front_by_cost[left]["delta"])
+                        dc = max(1, int(c - left))
+                        score = (ref_d - d) / float(dc)
+                item["stage1_score"] = float(score)
 
             coarse_sorted = sorted(
                 coarse_table,
@@ -2075,8 +2119,9 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             coarse_best_loss = sorted(coarse_table, key=lambda x: (x["delta"], x["cost"]))
             selected_ratios = {x["ratio"] for x in coarse_sorted[:stage1_topk]}
             selected_ratios.update({x["ratio"] for x in coarse_best_loss[:stage1_topk]})
+            # Always keep the low-ratio anchor (important for budget reallocation).
+            selected_ratios.add(min(candidates))
             if args.loss_aware_include_bounds:
-                selected_ratios.add(min(candidates))
                 selected_ratios.add(max(candidates))
             selected_ratios.add(min(candidates, key=lambda r: abs(float(r) - float(args.ratio))))
             selected_candidates = sorted(selected_ratios)
