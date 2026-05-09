@@ -695,22 +695,7 @@ def whitening_local_update(
             layer_rank_values.append(rk)
             layer_rank_map[name] = rk
         
-        def add_batch(name):
-            def tmp(_, inp, out):
-                gpts[name].add_batch_update_u(inp[0].data, out.data)
-            return tmp
-        handles = []
-        for name in gpts:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
-        if "opt" not in model_name:
-            outs = _layer_forward_chunked(layer, inps, attention_masks, position_ids)
-        else:
-            outs = _layer_forward_chunked(layer, inps, attention_masks, None)
-        for h in handles:
-            h.remove()
-        for name in gpts:
-            svd_u, svd_v = gpts[name].fasterprune()
-            svd_u, svd_v = svd_u.to(dtype), svd_v.to(dtype)
+        def _assign_svd_factor(name, svd_u, svd_v):
             if 'opt' in model_name:
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
@@ -758,6 +743,98 @@ def whitening_local_update(
                 elif "up_proj" in name:
                     svd_mlp.up_u_proj.weight.data = svd_u
                     svd_mlp.up_v_proj.weight.data = svd_v
+
+        def _base_svd_factor(name):
+            sqrt_sigma = torch.sqrt(gpts[name].truc_sigma)
+            svd_u = gpts[name].truc_u.matmul(sqrt_sigma)
+            svd_v = sqrt_sigma.matmul(gpts[name].truc_v)
+            return svd_u.to(dtype), svd_v.to(dtype)
+
+        def _solve_and_assign(names):
+            for name in names:
+                svd_u, svd_v = gpts[name].fasterprune()
+                _assign_svd_factor(name, svd_u.to(dtype), svd_v.to(dtype))
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                gpts[name].add_batch_update_u(inp[0].data, out.data)
+            return tmp
+
+        def _run_layer_chunks_no_output(layer_mod, hs, attn, pos_ids=None):
+            n = hs.shape[0]
+            for st in range(0, n, update_layer_batch_size):
+                ed = min(n, st + update_layer_batch_size)
+                if "opt" not in model_name:
+                    layer_mod(
+                        hs[st:ed],
+                        attention_mask=attn[st:ed],
+                        position_ids=pos_ids[st:ed],
+                    )
+                else:
+                    layer_mod(
+                        hs[st:ed],
+                        attention_mask=attn[st:ed],
+                    )
+
+        downstream_names = [n for n in gpts if ("o_proj" in n or "down_proj" in n or "out_proj" in n or "fc2" in n)]
+        first_names = [n for n in gpts if n not in downstream_names]
+
+        if "opt" in model_name:
+            handles = []
+            for name in gpts:
+                handles.append(subset[name].register_forward_hook(add_batch(name)))
+            outs = _layer_forward_chunked(layer, inps, attention_masks, None)
+            for h in handles:
+                h.remove()
+            _solve_and_assign(list(gpts.keys()))
+        else:
+            # True-sequential local update inside each transformer block:
+            # first update q/k/v and gate/up against the original layer, then
+            # update o/down using inputs produced by those compressed submodules
+            # while keeping the full-precision o/down outputs as targets.
+            handles = []
+            for name in first_names:
+                handles.append(subset[name].register_forward_hook(add_batch(name)))
+            _run_layer_chunks_no_output(layer, inps, attention_masks, position_ids)
+            for h in handles:
+                h.remove()
+            _solve_and_assign(first_names)
+
+            for name in downstream_names:
+                svd_u, svd_v = _base_svd_factor(name)
+                _assign_svd_factor(name, svd_u, svd_v)
+
+            original_self_attn = layer.self_attn
+            original_mlp = layer.mlp
+            for st in range(0, inps.shape[0], update_layer_batch_size):
+                ed = min(inps.shape[0], st + update_layer_batch_size)
+                hs_chunk = inps[st:ed]
+                attn_chunk = attention_masks[st:ed]
+                pos_chunk = position_ids[st:ed]
+                layer.self_attn = svd_attn
+                layer.mlp = svd_mlp
+                input_handles = []
+                if any("o_proj" in n for n in downstream_names):
+                    def capture_o_input(_, inp, out):
+                        name = next((n for n in downstream_names if "o_proj" in n), None)
+                        if name is not None:
+                            target = original_self_attn.o_proj(inp[0].detach())
+                            gpts[name].add_batch_update_u(inp[0].data, target.data)
+                    input_handles.append(svd_attn.o_v_proj.register_forward_hook(capture_o_input))
+                if any("down_proj" in n for n in downstream_names):
+                    def capture_down_input(_, inp, out):
+                        name = next((n for n in downstream_names if "down_proj" in n), None)
+                        if name is not None:
+                            target = original_mlp.down_proj(inp[0].detach())
+                            gpts[name].add_batch_update_u(inp[0].data, target.data)
+                    input_handles.append(svd_mlp.down_v_proj.register_forward_hook(capture_down_input))
+                layer(hs_chunk, attention_mask=attn_chunk, position_ids=pos_chunk)
+                for h in input_handles:
+                    h.remove()
+
+            _solve_and_assign(downstream_names)
+            layer.self_attn = svd_attn
+            layer.mlp = svd_mlp
         # Replace modules after all weights have been assigned
         if 'opt' in model_name:
             svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
@@ -1186,7 +1263,7 @@ def _get_transformer_layers(model_name, model):
 
 
 @torch.no_grad()
-def _eval_calib_loss(
+def _eval_calib_loss_stats(
     model,
     calib_data,
     dev,
@@ -1194,6 +1271,10 @@ def _eval_calib_loss(
     use_autocast_bf16=False,
     early_stop_loss=None,
     early_stop_min_batches=0,
+    start_batch=0,
+    initial_loss_sum=0.0,
+    initial_tokens=0,
+    initial_batches=0,
 ):
     prev_use_cache = getattr(model.config, "use_cache", None)
     if prev_use_cache is not None:
@@ -1203,9 +1284,13 @@ def _eval_calib_loss(
     device_type = dev_obj.type
     enable_autocast = bool(use_autocast_bf16 and device_type == "cuda" and torch.cuda.is_available())
     early_stop_min_batches = max(0, int(early_stop_min_batches))
-    total_loss = 0.0
-    total_tokens = 0
+    start_batch = max(0, int(start_batch))
+    total_loss = float(initial_loss_sum)
+    total_tokens = int(initial_tokens)
+    batches_done = int(initial_batches)
     for bi, batch in enumerate(calib_data):
+        if bi < start_batch:
+            continue
         if max_batches is not None and bi >= max_batches:
             break
         # If calibration batches are preloaded on device, avoid repeated copies.
@@ -1228,19 +1313,49 @@ def _eval_calib_loss(
         ntok = int(labels.numel())
         total_loss += loss_val * ntok
         total_tokens += ntok
+        batches_done += 1
         if (
             early_stop_loss is not None
             and total_tokens > 0
-            and (bi + 1) >= early_stop_min_batches
+            and batches_done >= early_stop_min_batches
         ):
             running_loss = total_loss / total_tokens
             if running_loss > float(early_stop_loss):
                 break
     if prev_use_cache is not None:
         model.config.use_cache = prev_use_cache
+    loss = (total_loss / total_tokens) if total_tokens > 0 else float("inf")
+    return {
+        "loss": float(loss),
+        "loss_sum": float(total_loss),
+        "tokens": int(total_tokens),
+        "batches": int(batches_done),
+    }
+
+
+@torch.no_grad()
+def _eval_calib_loss(
+    model,
+    calib_data,
+    dev,
+    max_batches=None,
+    use_autocast_bf16=False,
+    early_stop_loss=None,
+    early_stop_min_batches=0,
+):
+    stats = _eval_calib_loss_stats(
+        model,
+        calib_data,
+        dev,
+        max_batches=max_batches,
+        use_autocast_bf16=use_autocast_bf16,
+        early_stop_loss=early_stop_loss,
+        early_stop_min_batches=early_stop_min_batches,
+    )
+    total_tokens = int(stats["tokens"])
     if total_tokens <= 0:
         return float("inf")
-    return total_loss / total_tokens
+    return float(stats["loss"])
 
 
 def _rank_from_ratio(m, n, ratio, max_rank=None):
@@ -1436,16 +1551,20 @@ def _loss_aware_context_greedy_repair(
     if not active_layers:
         return chosen_idx
 
-    active_backups = {}
-    for li in active_layers:
+    full_backups = {}
+    for li in range(n_layers):
         subset = find_layers(layers[li])
-        active_backups[li] = {name: mod.weight.data.detach().cpu().clone() for name, mod in subset.items()}
+        full_backups[li] = {name: mod.weight.data.detach().cpu().clone() for name, mod in subset.items()}
+    print(
+        f"[loss-aware-context] full-context repair: compressed_layers={n_layers}, "
+        f"active_layers={len(active_layers)}, batches={context_batches}"
+    )
 
     def _set_layer_ratio_from_backup(layer_id, ratio_i):
         layer = layers[layer_id]
         subset = find_layers(layer)
         profile_layer = profiling_mat[layer_id] if (profiling_mat is not None and layer_id in profiling_mat) else None
-        bkp = active_backups[layer_id]
+        bkp = full_backups[layer_id]
         for name, mod in subset.items():
             W = bkp[name].to(mod.weight.device, dtype=torch.float32)
             scaling_inv = None
@@ -1475,16 +1594,18 @@ def _loss_aware_context_greedy_repair(
             w_hat = torch.matmul(truc_u * truc_s.unsqueeze(0), truc_v)
             mod.weight.data.copy_(w_hat.to(mod.weight.device, dtype=mod.weight.dtype))
 
-    def _restore_active_full_weights():
-        for li in active_layers:
+    def _restore_full_weights():
+        for li in range(n_layers):
             subset = find_layers(layers[li])
-            bkp = active_backups[li]
+            bkp = full_backups[li]
             for name, mod in subset.items():
                 mod.weight.data.copy_(bkp[name].to(mod.weight.device, dtype=mod.weight.dtype))
 
     try:
-        # Build a partial compressed context on active layers only.
-        for li in active_layers:
+        # Build the real compressed context for every transformer layer before
+        # measuring local up/down proposals. This keeps the repair objective
+        # aligned with the final all-layer compressed model.
+        for li in range(n_layers):
             ci = int(chosen_idx[li])
             _set_layer_ratio_from_backup(li, float(layer_tables[li][ci]["ratio"]))
         base_ctx_loss = _eval_calib_loss(
@@ -1590,8 +1711,8 @@ def _loss_aware_context_greedy_repair(
         else:
             print("[loss-aware-context] no positive one-step repair found.")
     finally:
-        _restore_active_full_weights()
-        active_backups.clear()
+        _restore_full_weights()
+        full_backups.clear()
         torch.cuda.empty_cache()
     return chosen_idx
 
@@ -1720,37 +1841,54 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         layer_full_sizes.append(layer_full)
 
         table = []
+        ratio_apply_cache = {}
 
         def _apply_ratio(ratio_i):
-            rank_map = {}
-            cost_i = 0
-            for name, mod in subset.items():
-                info = layer_cache[name]
-                rank_k = _rank_from_ratio(info["m"], info["n"], ratio_i, max_rank=args.module_rank_max)
-                rank_k = max(1, min(rank_k, info["k_cap"]))
-                rank_map[name] = int(rank_k)
-                cost_i += int(rank_k * (info["m"] + info["n"]))
-            for name, mod in subset.items():
-                info = layer_cache[name]
-                rank_k = int(rank_map[name])
-                U = info["U"][:, :rank_k]
-                S = info["S"][:rank_k]
-                V = info["V"][:rank_k, :]
-                w_hat = torch.matmul(U * S.unsqueeze(0), V)
-                mod.weight.data.copy_(w_hat.to(mod.weight.device, dtype=mod.weight.dtype))
-            return cost_i
+            ratio_key = round(float(ratio_i), 8)
+            cached = ratio_apply_cache.get(ratio_key)
+            if cached is None:
+                rank_map = {}
+                cost_i = 0
+                weights = {}
+                for name, mod in subset.items():
+                    info = layer_cache[name]
+                    rank_k = _rank_from_ratio(info["m"], info["n"], ratio_i, max_rank=args.module_rank_max)
+                    rank_k = max(1, min(rank_k, info["k_cap"]))
+                    rank_map[name] = int(rank_k)
+                    cost_i += int(rank_k * (info["m"] + info["n"]))
+                for name, mod in subset.items():
+                    info = layer_cache[name]
+                    rank_k = int(rank_map[name])
+                    U = info["U"][:, :rank_k]
+                    S = info["S"][:rank_k]
+                    V = info["V"][:rank_k, :]
+                    w_hat = torch.matmul(U * S.unsqueeze(0), V)
+                    weights[name] = w_hat.to(dtype=mod.weight.dtype).cpu()
+                    mod.weight.data.copy_(weights[name].to(mod.weight.device, non_blocking=True))
+                cached = {
+                    "cost": int(cost_i),
+                    "weights": weights,
+                }
+                ratio_apply_cache[ratio_key] = cached
+            else:
+                for name, mod in subset.items():
+                    mod.weight.data.copy_(cached["weights"][name].to(mod.weight.device, non_blocking=True))
+            return int(cached["cost"])
 
         if use_two_stage:
             coarse_table = []
+            coarse_stats = {}
             for ratio_i in candidates:
                 cost_i = _apply_ratio(ratio_i)
-                loss_i = _eval_calib_loss(
+                stats_i = _eval_calib_loss_stats(
                     model,
                     eval_data,
                     args.DEV,
                     max_batches=stage1_batches,
                     use_autocast_bf16=use_autocast_bf16,
                 )
+                loss_i = float(stats_i["loss"])
+                coarse_stats[float(ratio_i)] = stats_i
                 coarse_table.append({
                     "ratio": float(ratio_i),
                     "cost": int(cost_i),
@@ -1861,15 +1999,35 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             stop_loss = None
             if use_early_stop and layer_best_loss < float("inf"):
                 stop_loss = layer_best_loss + early_stop_margin
-            loss_i = _eval_calib_loss(
-                model,
-                eval_data,
-                args.DEV,
-                max_batches=full_max_batches,
-                use_autocast_bf16=use_autocast_bf16,
-                early_stop_loss=stop_loss,
-                early_stop_min_batches=early_stop_min_batches,
+            prefix_stats = coarse_stats.get(float(ratio_i)) if use_two_stage else None
+            can_reuse_prefix = (
+                prefix_stats is not None
+                and (full_max_batches is None or int(prefix_stats["batches"]) <= int(full_max_batches))
+                and (not use_early_stop)
             )
+            if can_reuse_prefix:
+                stats_i = _eval_calib_loss_stats(
+                    model,
+                    eval_data,
+                    args.DEV,
+                    max_batches=full_max_batches,
+                    use_autocast_bf16=use_autocast_bf16,
+                    start_batch=int(prefix_stats["batches"]),
+                    initial_loss_sum=float(prefix_stats["loss_sum"]),
+                    initial_tokens=int(prefix_stats["tokens"]),
+                    initial_batches=int(prefix_stats["batches"]),
+                )
+                loss_i = float(stats_i["loss"])
+            else:
+                loss_i = _eval_calib_loss(
+                    model,
+                    eval_data,
+                    args.DEV,
+                    max_batches=full_max_batches,
+                    use_autocast_bf16=use_autocast_bf16,
+                    early_stop_loss=stop_loss,
+                    early_stop_min_batches=early_stop_min_batches,
+                )
             layer_best_loss = min(layer_best_loss, loss_i)
             delta_i = loss_i - base_loss
             table.append({
@@ -1881,6 +2039,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         table.sort(key=lambda x: x["ratio"])
         for name, mod in subset.items():
             mod.weight.data.copy_(layer_cache[name]["backup"].to(mod.weight.device, dtype=mod.weight.dtype))
+        ratio_apply_cache.clear()
         layer_cache.clear()
         layer_tables.append(table)
         if args.print_layer_ratios:
