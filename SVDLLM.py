@@ -409,11 +409,16 @@ def whitening(
         if "llama" in model_name or "vicuna" in model_name:
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = svd_attn.to(dev)
+            svd_mlp = svd_mlp.to(dev)
         elif "mistral" in model_name:
             svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = svd_attn.to(dev)
+            svd_mlp = svd_mlp.to(dev)
         elif 'opt' in model_name:
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio_i, ranks=ranks_layer if ranks_layer else None)
+            svd_decoder = svd_decoder.to(dev)
         #### Replace Attn, MLP ####
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
@@ -658,11 +663,16 @@ def whitening_local_update(
         if "llama" in model_name or "vicuna" in model_name:
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = svd_attn.to(dev)
+            svd_mlp = svd_mlp.to(dev)
         elif "mistral" in model_name:
             svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = svd_attn.to(dev)
+            svd_mlp = svd_mlp.to(dev)
         elif 'opt' in model_name:
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio_i, ranks=ranks_layer if ranks_layer else None)
+            svd_decoder = svd_decoder.to(dev)
         for name in subset:
             if profiling_mat is not None:
                 scaling_diag_matrix = profiling_mat[i][name].to(dev)
