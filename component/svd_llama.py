@@ -60,8 +60,8 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
             self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
         return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.cos_cached[:, :, :seq_len, ...].to(device=x.device, dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(device=x.device, dtype=x.dtype),
         )
 
 
@@ -73,6 +73,7 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    position_ids = position_ids.to(device=cos.device)
     gather_indices = position_ids[:, None, :, None]  # [bs, 1, seq_len, 1]
     gather_indices = gather_indices.repeat(1, cos.shape[1], 1, cos.shape[3])
     cos = torch.gather(cos.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)

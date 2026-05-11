@@ -1655,12 +1655,29 @@ def _loss_aware_context_greedy_repair(
         f"[loss-aware-context] full-context repair: compressed_layers={n_layers}, "
         f"active_layers={len(initial_active_layers)}, batches={context_batches}"
     )
+    choice_weight_cache = {}
+
+    def _choice_cache_key(choice):
+        rank_map = choice.get("rank_map", None)
+        if rank_map:
+            rank_sig = tuple(sorted((str(name), int(rank)) for name, rank in rank_map.items()))
+        else:
+            rank_sig = ()
+        return (round(float(choice["ratio"]), 8), rank_sig)
 
     def _set_layer_choice_from_backup(layer_id, choice):
         layer = layers[layer_id]
         subset = find_layers(layer)
+        cache_key = (int(layer_id), _choice_cache_key(choice))
+        cached_weights = choice_weight_cache.get(cache_key)
+        if cached_weights is not None:
+            for name, mod in subset.items():
+                mod.weight.data.copy_(cached_weights[name].to(device=mod.weight.device, dtype=mod.weight.dtype, non_blocking=True))
+            return
+
         profile_layer = profiling_mat[layer_id] if (profiling_mat is not None and layer_id in profiling_mat) else None
         bkp = full_backups[layer_id]
+        weights = {}
         for name, mod in subset.items():
             W = bkp[name].to(mod.weight.device, dtype=torch.float32)
             scaling_inv = None
@@ -1692,7 +1709,9 @@ def _loss_aware_context_greedy_repair(
             if scaling_inv is not None:
                 truc_v = torch.matmul(truc_v, scaling_inv)
             w_hat = torch.matmul(truc_u * truc_s.unsqueeze(0), truc_v)
-            mod.weight.data.copy_(w_hat.to(mod.weight.device, dtype=mod.weight.dtype))
+            weights[name] = w_hat.to(dtype=mod.weight.dtype).cpu()
+            mod.weight.data.copy_(weights[name].to(device=mod.weight.device, dtype=mod.weight.dtype, non_blocking=True))
+        choice_weight_cache[cache_key] = weights
 
     def _restore_full_weights():
         for li in range(n_layers):
@@ -1847,6 +1866,7 @@ def _loss_aware_context_greedy_repair(
     finally:
         _restore_full_weights()
         full_backups.clear()
+        choice_weight_cache.clear()
         torch.cuda.empty_cache()
     return chosen_idx
 

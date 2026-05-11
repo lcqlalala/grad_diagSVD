@@ -118,8 +118,8 @@ class MistralRotaryEmbedding(nn.Module):
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
         return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
+            self.cos_cached[:seq_len].to(device=x.device, dtype=x.dtype),
+            self.sin_cached[:seq_len].to(device=x.device, dtype=x.dtype),
         )
 
 
@@ -153,6 +153,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    position_ids = position_ids.to(device=cos.device)
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
