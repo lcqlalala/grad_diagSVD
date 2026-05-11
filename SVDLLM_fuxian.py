@@ -769,13 +769,13 @@ def whitening(
         layer_rank_map = {}
         #### Replace Attn, MLP ####
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
         elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
         elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, ranks=ranks_layer if ranks_layer else None)
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio_i, ranks=ranks_layer if ranks_layer else None)
         #### Replace Attn, MLP ####
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
@@ -1018,13 +1018,13 @@ def whitening_local_update(
         layer_rank_values = []
         layer_rank_map = {}
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
         elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
         elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, ranks=ranks_layer if ranks_layer else None)
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio_i, ranks=ranks_layer if ranks_layer else None)
         for name in subset:
             if profiling_mat is not None:
                 scaling_diag_matrix = profiling_mat[i][name].to(dev)
@@ -3152,6 +3152,8 @@ if __name__ == '__main__':
         help='Disable one-shot bi-side correction and use U-only closed-form update.')
     parser.add_argument('--disable_weighted_update', action='store_true',
         help='Disable weighted update and use uniform token weights in local correction.')
+    parser.add_argument('--disable_simultaneous_update', action='store_true',
+        help='In step 2, skip simultaneous local update and save the whitening/SVD model only. Useful for isolating full-context repair.')
     parser.add_argument('--bi_weight_mode', type=str, default='residual', choices=['residual', 'output_norm', 'uniform'],
         help='Sample weighting mode for one-shot correction.')
     parser.add_argument('--bi_weight_alpha', type=float, default=0.5,
@@ -3251,9 +3253,11 @@ if __name__ == '__main__':
             model.seqlen = model.config.max_position_embeddings
         else:
             model.seqlen = 2048
-        dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
+        dataloader = None
+        if not args.disable_simultaneous_update:
+            dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         model = model.eval()
-        if args.update_use_fp32:
+        if args.update_use_fp32 and not args.disable_simultaneous_update:
             model = model.float()
         layer_ratios = None
         module_ranks = None
@@ -3285,31 +3289,52 @@ if __name__ == '__main__':
         if args.use_module_rank_allocation and not args.use_loss_aware_layerwise:
             module_ranks = _obtain_module_ranks(args, model, profiling_mat)
             layer_ratios = None
-        if args.use_loss_aware_layerwise:
-            print("[method] Loss-aware rank allocation + weighted one-shot bi-side closed-form correction")
-        whitening_local_update(
-            args.model,
-            model,
-            dataloader,
-            profiling_mat,
-            args.ratio,
-            args.DEV,
-            layer_ratios=layer_ratios,
-            module_ranks=module_ranks,
-            debug_svd=args.debug_svd,
-            use_bi_closed_form=not args.disable_bi_closed_form,
-            use_weighted_update=not args.disable_weighted_update,
-            bi_weight_mode=args.bi_weight_mode,
-            bi_weight_alpha=args.bi_weight_alpha,
-            bi_weight_clip=args.bi_weight_clip,
-            bi_u_ridge=args.bi_u_ridge,
-            bi_v_ridge=args.bi_v_ridge,
-            bi_sigma_eps=args.bi_sigma_eps,
-            print_layer_rank_detail=args.print_layer_rank_detail,
-            update_layer_batch_size=args.update_layer_batch_size,
-        )
+        if args.disable_simultaneous_update:
+            if args.use_loss_aware_layerwise:
+                print("[method] Loss-aware rank allocation + optional full-context repair + whitening only (simultaneous update disabled)")
+            else:
+                print("[method] Whitening only (simultaneous update disabled)")
+            whitening(
+                args.model,
+                model,
+                profiling_mat,
+                args.ratio,
+                args.DEV,
+                layer_ratios=layer_ratios,
+                module_ranks=module_ranks,
+                debug_svd=args.debug_svd,
+                print_layer_rank_detail=args.print_layer_rank_detail,
+            )
+        else:
+            if args.use_loss_aware_layerwise:
+                print("[method] Loss-aware rank allocation + weighted one-shot bi-side closed-form correction")
+            whitening_local_update(
+                args.model,
+                model,
+                dataloader,
+                profiling_mat,
+                args.ratio,
+                args.DEV,
+                layer_ratios=layer_ratios,
+                module_ranks=module_ranks,
+                debug_svd=args.debug_svd,
+                use_bi_closed_form=not args.disable_bi_closed_form,
+                use_weighted_update=not args.disable_weighted_update,
+                bi_weight_mode=args.bi_weight_mode,
+                bi_weight_alpha=args.bi_weight_alpha,
+                bi_weight_clip=args.bi_weight_clip,
+                bi_u_ridge=args.bi_u_ridge,
+                bi_v_ridge=args.bi_v_ridge,
+                bi_sigma_eps=args.bi_sigma_eps,
+                print_layer_rank_detail=args.print_layer_rank_detail,
+                update_layer_batch_size=args.update_layer_batch_size,
+            )
         if args.save_path is not None:
-            _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')
+            if args.disable_simultaneous_update:
+                save_name = '_whitening_only_step2_' + str(args.ratio) + '.pt'
+            else:
+                save_name = '_whitening_then_update_' + str(args.ratio) + '.pt'
+            _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + save_name)
     elif args.step == 3:
         model, tokenizer = get_model_from_huggingface(args.model)
         model = model.eval()
