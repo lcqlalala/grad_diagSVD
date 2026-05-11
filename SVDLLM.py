@@ -346,8 +346,10 @@ def _print_layer_compression_stats(prefix, layer_id, full_params, low_params, co
 
 
 def _module_rank_type(name):
-    if any(t in name for t in ("q_proj", "k_proj", "v_proj")):
-        return "qkv"
+    if any(t in name for t in ("q_proj", "k_proj")):
+        return "qk"
+    if "v_proj" in name:
+        return "v"
     if any(t in name for t in ("o_proj", "out_proj")):
         return "o"
     if "down_proj" in name:
@@ -358,11 +360,11 @@ def _module_rank_type(name):
 
 
 def _print_layer_rank_detail(layer_id, rank_map):
-    groups = {"qkv": [], "o": [], "mlp": [], "down": [], "other": []}
+    groups = {"qk": [], "v": [], "o": [], "mlp": [], "down": [], "other": []}
     for name, k in rank_map.items():
         groups[_module_rank_type(name)].append(int(k))
     parts = []
-    for key in ("qkv", "o", "mlp", "down", "other"):
+    for key in ("qk", "v", "o", "mlp", "down", "other"):
         vals = groups[key]
         if not vals:
             continue
@@ -1376,6 +1378,99 @@ def _rank_from_ratio(m, n, ratio, max_rank=None):
     return k
 
 
+def _loss_aware_module_priority(name):
+    if "down_proj" in name or "fc2" in name:
+        return 1.45
+    if "o_proj" in name or "out_proj" in name:
+        return 1.35
+    if "v_proj" in name:
+        return 1.25
+    if "gate_proj" in name or "up_proj" in name:
+        return 0.90
+    if "q_proj" in name or "k_proj" in name:
+        return 0.70
+    return 1.0
+
+
+def _loss_aware_modulewise_rank_map(layer_cache, ratio_i, max_rank=None, min_rank_ratio=0.0):
+    base = {}
+    min_ranks = {}
+    target_cost = 0
+    min_rank_ratio = max(0.0, min(1.0, float(min_rank_ratio)))
+    for name, info in layer_cache.items():
+        k = _rank_from_ratio(info["m"], info["n"], ratio_i, max_rank=max_rank)
+        k = max(1, min(k, info["k_cap"], min(info["m"], info["n"])))
+        base[name] = int(k)
+        min_ranks[name] = max(1, min(int(math.ceil(float(k) * min_rank_ratio)), int(k)))
+        target_cost += int(k * (info["m"] + info["n"]))
+
+    # Reallocate the same layer budget across modules: q/k are usually easier
+    # to approximate, while v/o/down dominate accumulated block error.
+    desired = {
+        name: max(1.0, float(k) * _loss_aware_module_priority(name))
+        for name, k in base.items()
+    }
+
+    def _cost(rank_map):
+        return sum(int(rank_map[n] * (layer_cache[n]["m"] + layer_cache[n]["n"])) for n in rank_map)
+
+    def _scaled(scale):
+        ranks = {}
+        for name, want in desired.items():
+            info = layer_cache[name]
+            cap = min(info["k_cap"], min(info["m"], info["n"]))
+            k = int(math.floor(want * scale))
+            floor_k = int(min_ranks[name])
+            ranks[name] = max(floor_k, min(int(k), int(cap)))
+        return ranks
+
+    lo, hi = 0.0, 1.0
+    while _cost(_scaled(hi)) <= target_cost:
+        hi *= 2.0
+        if hi > 16.0:
+            break
+    best = _scaled(lo)
+    for _ in range(40):
+        mid = (lo + hi) * 0.5
+        cur = _scaled(mid)
+        if _cost(cur) <= target_cost:
+            best = cur
+            lo = mid
+        else:
+            hi = mid
+
+    cur_cost = _cost(best)
+    while True:
+        remain = target_cost - cur_cost
+        addable = []
+        for name, info in layer_cache.items():
+            cap = min(info["k_cap"], min(info["m"], info["n"]))
+            step_cost = int(info["m"] + info["n"])
+            if best[name] < cap and step_cost <= remain:
+                score = _loss_aware_module_priority(name) / max(1, step_cost)
+                addable.append((score, name, step_cost))
+        if not addable:
+            break
+        _, name, step_cost = max(addable, key=lambda x: (x[0], x[1]))
+        best[name] += 1
+        cur_cost += step_cost
+
+    while cur_cost > target_cost:
+        removable = []
+        for name, info in layer_cache.items():
+            step_cost = int(info["m"] + info["n"])
+            if best[name] > int(min_ranks[name]):
+                score = _loss_aware_module_priority(name) / max(1, step_cost)
+                removable.append((score, name, step_cost))
+        if not removable:
+            break
+        _, name, step_cost = min(removable, key=lambda x: (x[0], x[1]))
+        best[name] -= 1
+        cur_cost -= step_cost
+
+    return {name: int(k) for name, k in best.items()}
+
+
 @torch.no_grad()
 def _low_rank_weight_from_ratio(module, ratio, dev, scaling_diag_matrix=None, max_rank=None):
     W = module.weight.data.float().to(dev).clone()
@@ -1539,38 +1634,29 @@ def _loss_aware_context_greedy_repair(
 
     n_layers = len(layer_tables)
     chosen_idx = list(chosen_idx)
-    chosen_cost = sum(int(layer_tables[i][chosen_idx[i]]["cost"]) for i in range(n_layers))
-    slack = int(max(0, int(round(target_params)) - chosen_cost))
-
-    up_candidates = []
-    down_candidates = []
-    for li in range(n_layers):
-        ci = int(chosen_idx[li])
-        table = layer_tables[li]
-        cur_delta = float(table[ci]["delta"])
-        if ci + 1 < len(table):
-            up_candidates.append((li, cur_delta))
-        if ci - 1 >= 0:
-            down_candidates.append((li, cur_delta))
-    if not up_candidates and not down_candidates:
-        return chosen_idx
-
-    up_layers = [li for li, _ in sorted(up_candidates, key=lambda x: x[1], reverse=True)[:context_topk]]
-    down_layers = [li for li, _ in sorted(down_candidates, key=lambda x: x[1])[:context_topk]]
-    active_layers = sorted(set(up_layers + down_layers))
-    if not active_layers:
-        return chosen_idx
-
     full_backups = {}
     for li in range(n_layers):
         subset = find_layers(layers[li])
         full_backups[li] = {name: mod.weight.data.detach().cpu().clone() for name, mod in subset.items()}
+    initial_up_candidates = []
+    initial_down_candidates = []
+    for li in range(n_layers):
+        ci = int(chosen_idx[li])
+        cur_delta = float(layer_tables[li][ci]["delta"])
+        if ci + 1 < len(layer_tables[li]):
+            initial_up_candidates.append((li, cur_delta))
+        if ci - 1 >= 0:
+            initial_down_candidates.append((li, cur_delta))
+    initial_active_layers = sorted(set(
+        [li for li, _ in sorted(initial_up_candidates, key=lambda x: x[1], reverse=True)[:context_topk]]
+        + [li for li, _ in sorted(initial_down_candidates, key=lambda x: x[1])[:context_topk]]
+    ))
     print(
         f"[loss-aware-context] full-context repair: compressed_layers={n_layers}, "
-        f"active_layers={len(active_layers)}, batches={context_batches}"
+        f"active_layers={len(initial_active_layers)}, batches={context_batches}"
     )
 
-    def _set_layer_ratio_from_backup(layer_id, ratio_i):
+    def _set_layer_choice_from_backup(layer_id, choice):
         layer = layers[layer_id]
         subset = find_layers(layer)
         profile_layer = profiling_mat[layer_id] if (profiling_mat is not None and layer_id in profiling_mat) else None
@@ -1594,7 +1680,11 @@ def _loss_aware_context_greedy_repair(
                 W_scale = W
             U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
             m, n = int(W.shape[0]), int(W.shape[1])
-            k = _rank_from_ratio(m, n, float(ratio_i), max_rank=args.module_rank_max)
+            rank_map = choice.get("rank_map", None)
+            if rank_map is not None and name in rank_map:
+                k = int(rank_map[name])
+            else:
+                k = _rank_from_ratio(m, n, float(choice["ratio"]), max_rank=args.module_rank_max)
             k = max(1, min(k, min(m, n)))
             truc_u = U[:, :k]
             truc_s = S[:k]
@@ -1617,95 +1707,127 @@ def _loss_aware_context_greedy_repair(
         # aligned with the final all-layer compressed model.
         for li in range(n_layers):
             ci = int(chosen_idx[li])
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ci]["ratio"]))
-        base_ctx_loss = _eval_calib_loss(
-            model,
-            eval_data,
-            args.DEV,
-            max_batches=context_batches,
-            use_autocast_bf16=use_autocast_bf16,
-        )
+            _set_layer_choice_from_backup(li, layer_tables[li][ci])
 
-        up_props = []
-        for li in up_layers:
-            ci = int(chosen_idx[li])
-            ni = ci + 1
-            if ni >= len(layer_tables[li]):
-                continue
-            c0 = int(layer_tables[li][ci]["cost"])
-            c1 = int(layer_tables[li][ni]["cost"])
-            extra_cost = c1 - c0
-            if extra_cost <= 0:
-                continue
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ni]["ratio"]))
-            loss_up = _eval_calib_loss(
+        max_iters = int(getattr(args, "loss_aware_context_max_iters", 0))
+        if max_iters <= 0:
+            max_iters = max(1, n_layers * 4)
+        for repair_iter in range(max_iters):
+            chosen_cost = sum(int(layer_tables[i][chosen_idx[i]]["cost"]) for i in range(n_layers))
+            slack = int(max(0, int(round(target_params)) - chosen_cost))
+            up_candidates = []
+            down_candidates = []
+            for li in range(n_layers):
+                ci = int(chosen_idx[li])
+                table = layer_tables[li]
+                cur_delta = float(table[ci]["delta"])
+                if ci + 1 < len(table):
+                    up_candidates.append((li, cur_delta))
+                if ci - 1 >= 0:
+                    down_candidates.append((li, cur_delta))
+            if not up_candidates and not down_candidates:
+                print(f"[loss-aware-context] stop iter={repair_iter}: no neighboring candidates.")
+                break
+
+            up_layers = [li for li, _ in sorted(up_candidates, key=lambda x: x[1], reverse=True)[:context_topk]]
+            down_layers = [li for li, _ in sorted(down_candidates, key=lambda x: x[1])[:context_topk]]
+            active_layers = sorted(set(up_layers + down_layers))
+            if not active_layers:
+                print(f"[loss-aware-context] stop iter={repair_iter}: no active layers.")
+                break
+
+            base_ctx_loss = _eval_calib_loss(
                 model,
                 eval_data,
                 args.DEV,
                 max_batches=context_batches,
                 use_autocast_bf16=use_autocast_bf16,
             )
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ci]["ratio"]))
-            gain = float(base_ctx_loss - loss_up)
-            up_props.append({
-                "layer": li,
-                "next_idx": ni,
-                "extra_cost": int(extra_cost),
-                "gain": float(gain),
-            })
 
-        down_props = []
-        for li in down_layers:
-            ci = int(chosen_idx[li])
-            ni = ci - 1
-            if ni < 0:
-                continue
-            c0 = int(layer_tables[li][ci]["cost"])
-            c1 = int(layer_tables[li][ni]["cost"])
-            free_cost = c0 - c1
-            if free_cost <= 0:
-                continue
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ni]["ratio"]))
-            loss_down = _eval_calib_loss(
-                model,
-                eval_data,
-                args.DEV,
-                max_batches=context_batches,
-                use_autocast_bf16=use_autocast_bf16,
-            )
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ci]["ratio"]))
-            harm = float(loss_down - base_ctx_loss)
-            down_props.append({
-                "layer": li,
-                "next_idx": ni,
-                "free_cost": int(free_cost),
-                "harm": float(harm),
-            })
+            up_props = []
+            for li in up_layers:
+                ci = int(chosen_idx[li])
+                ni = ci + 1
+                if ni >= len(layer_tables[li]):
+                    continue
+                c0 = int(layer_tables[li][ci]["cost"])
+                c1 = int(layer_tables[li][ni]["cost"])
+                extra_cost = c1 - c0
+                if extra_cost <= 0:
+                    continue
+                _set_layer_choice_from_backup(li, layer_tables[li][ni])
+                loss_up = _eval_calib_loss(
+                    model,
+                    eval_data,
+                    args.DEV,
+                    max_batches=context_batches,
+                    use_autocast_bf16=use_autocast_bf16,
+                )
+                _set_layer_choice_from_backup(li, layer_tables[li][ci])
+                gain = float(base_ctx_loss - loss_up)
+                up_props.append({
+                    "layer": li,
+                    "next_idx": ni,
+                    "extra_cost": int(extra_cost),
+                    "gain": float(gain),
+                })
 
-        best_action = None
-        for up in up_props:
-            if up["extra_cost"] <= slack and up["gain"] > 0:
-                score = float(up["gain"])
-                if best_action is None or score > best_action["score"]:
-                    best_action = {"type": "up", "up": up, "score": score}
-        for up in up_props:
-            for down in down_props:
-                if up["layer"] == down["layer"]:
+            down_props = []
+            for li in down_layers:
+                ci = int(chosen_idx[li])
+                ni = ci - 1
+                if ni < 0:
                     continue
-                if up["extra_cost"] > slack + down["free_cost"]:
+                c0 = int(layer_tables[li][ci]["cost"])
+                c1 = int(layer_tables[li][ni]["cost"])
+                free_cost = c0 - c1
+                if free_cost <= 0:
                     continue
-                net = float(up["gain"] - down["harm"])
-                if net <= 0:
-                    continue
-                if best_action is None or net > best_action["score"]:
-                    best_action = {"type": "swap", "up": up, "down": down, "score": net}
+                _set_layer_choice_from_backup(li, layer_tables[li][ni])
+                loss_down = _eval_calib_loss(
+                    model,
+                    eval_data,
+                    args.DEV,
+                    max_batches=context_batches,
+                    use_autocast_bf16=use_autocast_bf16,
+                )
+                _set_layer_choice_from_backup(li, layer_tables[li][ci])
+                harm = float(loss_down - base_ctx_loss)
+                down_props.append({
+                    "layer": li,
+                    "next_idx": ni,
+                    "free_cost": int(free_cost),
+                    "harm": float(harm),
+                })
 
-        if best_action is not None:
+            best_action = None
+            for up in up_props:
+                if up["extra_cost"] <= slack and up["gain"] > 0:
+                    score = float(up["gain"])
+                    if best_action is None or score > best_action["score"]:
+                        best_action = {"type": "up", "up": up, "score": score}
+            for up in up_props:
+                for down in down_props:
+                    if up["layer"] == down["layer"]:
+                        continue
+                    if up["extra_cost"] > slack + down["free_cost"]:
+                        continue
+                    net = float(up["gain"] - down["harm"])
+                    if net <= 0:
+                        continue
+                    if best_action is None or net > best_action["score"]:
+                        best_action = {"type": "swap", "up": up, "down": down, "score": net}
+
+            if best_action is None:
+                print(f"[loss-aware-context] stop iter={repair_iter}: no positive repair found.")
+                break
+
             if best_action["type"] == "up":
                 up = best_action["up"]
                 chosen_idx[up["layer"]] = int(up["next_idx"])
+                _set_layer_choice_from_backup(up["layer"], layer_tables[up["layer"]][up["next_idx"]])
                 print(
-                    f"[loss-aware-context] apply up: layer {up['layer']:02d} "
+                    f"[loss-aware-context] iter={repair_iter} apply up: layer {up['layer']:02d} "
                     f"gain={up['gain']:+.6f} extra_cost={up['extra_cost']} (slack={slack})"
                 )
             else:
@@ -1713,13 +1835,15 @@ def _loss_aware_context_greedy_repair(
                 down = best_action["down"]
                 chosen_idx[up["layer"]] = int(up["next_idx"])
                 chosen_idx[down["layer"]] = int(down["next_idx"])
+                _set_layer_choice_from_backup(up["layer"], layer_tables[up["layer"]][up["next_idx"]])
+                _set_layer_choice_from_backup(down["layer"], layer_tables[down["layer"]][down["next_idx"]])
                 print(
-                    f"[loss-aware-context] apply swap: up layer {up['layer']:02d} "
+                    f"[loss-aware-context] iter={repair_iter} apply swap: up layer {up['layer']:02d} "
                     f"gain={up['gain']:+.6f} + down layer {down['layer']:02d} "
                     f"harm={down['harm']:+.6f} net={best_action['score']:+.6f}"
                 )
         else:
-            print("[loss-aware-context] no positive one-step repair found.")
+            print(f"[loss-aware-context] stop: reached max_iters={max_iters}.")
     finally:
         _restore_full_weights()
         full_backups.clear()
@@ -1786,6 +1910,9 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
 
     candidates = _loss_aware_candidate_ratios(args)
     print(f"[loss-aware] ratio candidates: {', '.join(f'{r:.4f}' for r in candidates)}")
+    print("[loss-aware] module-wise ranks: q/k down-weighted, v/o/down up-weighted within each layer budget")
+    if float(args.module_rank_min_ratio) > 0:
+        print(f"[loss-aware] module rank floor: >= {float(args.module_rank_min_ratio):.3f} x uniform-ratio rank")
     use_two_stage = bool(args.loss_aware_two_stage and len(candidates) > stage1_topk)
     if use_two_stage:
         print(
@@ -1857,15 +1984,17 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             ratio_key = round(float(ratio_i), 8)
             cached = ratio_apply_cache.get(ratio_key)
             if cached is None:
-                rank_map = {}
-                cost_i = 0
+                rank_map = _loss_aware_modulewise_rank_map(
+                    layer_cache,
+                    ratio_i,
+                    max_rank=args.module_rank_max,
+                    min_rank_ratio=args.module_rank_min_ratio,
+                )
+                cost_i = sum(
+                    int(rank_map[name] * (layer_cache[name]["m"] + layer_cache[name]["n"]))
+                    for name in rank_map
+                )
                 weights = {}
-                for name, mod in subset.items():
-                    info = layer_cache[name]
-                    rank_k = _rank_from_ratio(info["m"], info["n"], ratio_i, max_rank=args.module_rank_max)
-                    rank_k = max(1, min(rank_k, info["k_cap"]))
-                    rank_map[name] = int(rank_k)
-                    cost_i += int(rank_k * (info["m"] + info["n"]))
                 for name, mod in subset.items():
                     info = layer_cache[name]
                     rank_k = int(rank_map[name])
@@ -1877,19 +2006,20 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                     mod.weight.data.copy_(weights[name].to(mod.weight.device, non_blocking=True))
                 cached = {
                     "cost": int(cost_i),
+                    "rank_map": {name: int(k) for name, k in rank_map.items()},
                     "weights": weights,
                 }
                 ratio_apply_cache[ratio_key] = cached
             else:
                 for name, mod in subset.items():
                     mod.weight.data.copy_(cached["weights"][name].to(mod.weight.device, non_blocking=True))
-            return int(cached["cost"])
+            return int(cached["cost"]), cached["rank_map"]
 
         if use_two_stage:
             coarse_table = []
             coarse_stats = {}
             for ratio_i in candidates:
-                cost_i = _apply_ratio(ratio_i)
+                cost_i, rank_map_i = _apply_ratio(ratio_i)
                 stats_i = _eval_calib_loss_stats(
                     model,
                     eval_data,
@@ -1902,6 +2032,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                 coarse_table.append({
                     "ratio": float(ratio_i),
                     "cost": int(cost_i),
+                    "rank_map": {name: int(k) for name, k in rank_map_i.items()},
                     "loss": float(loss_i),
                     "delta": float(loss_i - base_loss),
                 })
@@ -2005,7 +2136,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
 
         layer_best_loss = float("inf")
         for ratio_i in eval_order:
-            cost_i = _apply_ratio(ratio_i)
+            cost_i, rank_map_i = _apply_ratio(ratio_i)
             stop_loss = None
             if use_early_stop and layer_best_loss < float("inf"):
                 stop_loss = layer_best_loss + early_stop_margin
@@ -2043,10 +2174,11 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             table.append({
                 "ratio": float(ratio_i),
                 "cost": int(cost_i),
+                "rank_map": {name: int(k) for name, k in rank_map_i.items()},
                 "loss": float(loss_i),
                 "delta": float(delta_i),
             })
-        table.sort(key=lambda x: x["ratio"])
+        table.sort(key=lambda x: (x["cost"], x["delta"], x["ratio"]))
         for name, mod in subset.items():
             mod.weight.data.copy_(layer_cache[name]["backup"].to(mod.weight.device, dtype=mod.weight.dtype))
         ratio_apply_cache.clear()
@@ -2075,6 +2207,10 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         use_autocast_bf16=use_autocast_bf16,
     )
     chosen_ratios = [layer_tables[i][chosen_idx[i]]["ratio"] for i in range(len(layer_tables))]
+    chosen_module_ranks = {
+        i: {name: int(k) for name, k in layer_tables[i][chosen_idx[i]].get("rank_map", {}).items()}
+        for i in range(len(layer_tables))
+    }
     chosen_cost = sum(layer_tables[i][chosen_idx[i]]["cost"] for i in range(len(layer_tables)))
     chosen_delta = sum(layer_tables[i][chosen_idx[i]]["delta"] for i in range(len(layer_tables)))
     print(f"[loss-aware] selected effective_ratio={chosen_cost/max(total_full,1):.6f} "
@@ -2084,10 +2220,12 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             info = layer_tables[li][chosen_idx[li]]
             print(f"[loss-aware] layer {li:02d} ratio={ratio_i:.6f} "
                   f"cost={info['cost']} delta={info['delta']:+.6f}")
+            if args.print_layer_rank_detail and chosen_module_ranks.get(li):
+                _print_layer_rank_detail(li, chosen_module_ranks[li])
 
     if str(prev_device) == "cpu":
         model = model.cpu()
-    return chosen_ratios
+    return chosen_ratios, chosen_module_ranks
 
 
 if __name__ == '__main__':
@@ -2108,7 +2246,7 @@ if __name__ == '__main__':
     parser.add_argument('--layer_ratio_strict', action='store_true', help='Rescale layer ratios to exactly match the global keep ratio')
     parser.add_argument('--print_layer_ratios', action='store_true', help='Print per-layer keep ratios and effective global ratio')
     parser.add_argument('--use_loss_aware_layerwise', action='store_true',
-        help='Allocate one uniform keep ratio per layer by real calibration loss (NLL) + dynamic programming under global budget.')
+        help='Allocate loss-aware per-layer choices with module-wise ranks by calibration NLL + dynamic programming under global budget.')
     parser.add_argument('--loss_aware_nsamples', type=int, default=8,
         help='Number of calibration batches for loss-aware layerwise allocation.')
     parser.add_argument('--loss_aware_seq_len', type=int, default=512,
@@ -2144,12 +2282,16 @@ if __name__ == '__main__':
     parser.add_argument('--loss_aware_dp_bins', type=int, default=2000,
         help='DP budget bins for loss-aware layerwise allocation (larger = finer budget match, slower DP).')
     parser.add_argument('--loss_aware_context_greedy_repair', action='store_true',
-        help='After DP, run one-step greedy repair under compressed-context proxy (budget-aware).')
+        help='After DP, run iterative greedy repair under full compressed-context proxy (budget-aware).')
     parser.add_argument('--loss_aware_context_batches', type=int, default=4,
         help='Calibration batches used by context greedy repair.')
     parser.add_argument('--loss_aware_context_topk_layers', type=int, default=8,
         help='Top-k sensitive layers considered by context greedy repair.')
+    parser.add_argument('--loss_aware_context_max_iters', type=int, default=0,
+        help='Maximum greedy repair iterations. 0 means auto (4x number of layers).')
     parser.add_argument('--module_rank_max', type=int, default=None, help='Maximum rank per module (default: min(out,in))')
+    parser.add_argument('--module_rank_min_ratio', type=float, default=0.0,
+        help='Minimum module rank as a fraction of its uniform-ratio rank during module-wise allocation. 0 disables it.')
     parser.add_argument('--print_layer_rank_detail', action='store_true',
         help='Print per-layer rank detail by module type (qkv/o/mlp/down).')
     parser.add_argument('--disable_bi_closed_form', action='store_true',
@@ -2208,13 +2350,17 @@ if __name__ == '__main__':
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
         if args.use_loss_aware_layerwise:
-            layer_ratios = _obtain_loss_aware_layer_ratios(
+            loss_aware_result = _obtain_loss_aware_layer_ratios(
                 args,
                 model,
                 tokenizer,
                 profiling_mat,
                 cali_white_data=cali_white_data,
             )
+            if isinstance(loss_aware_result, tuple):
+                layer_ratios, module_ranks = loss_aware_result
+            else:
+                layer_ratios = loss_aware_result
         elif args.use_layerwise_ratio:
             layer_ratios = _obtain_layer_ratios(args, model, None)
         whitening(
@@ -2247,13 +2393,17 @@ if __name__ == '__main__':
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
         if args.use_loss_aware_layerwise:
-            layer_ratios = _obtain_loss_aware_layer_ratios(
+            loss_aware_result = _obtain_loss_aware_layer_ratios(
                 args,
                 model,
                 tokenizer,
                 profiling_mat,
                 cali_white_data=cali_white_data,
             )
+            if isinstance(loss_aware_result, tuple):
+                layer_ratios, module_ranks = loss_aware_result
+            else:
+                layer_ratios = loss_aware_result
         elif args.use_layerwise_ratio:
             layer_ratios = _obtain_layer_ratios(args, model, None)
         if args.use_loss_aware_layerwise:
@@ -2290,13 +2440,17 @@ if __name__ == '__main__':
         layer_ratios = None
         module_ranks = None
         if args.use_loss_aware_layerwise:
-            layer_ratios = _obtain_loss_aware_layer_ratios(
+            loss_aware_result = _obtain_loss_aware_layer_ratios(
                 args,
                 model,
                 tokenizer,
                 profiling_mat=None,
                 cali_white_data=None,
             )
+            if isinstance(loss_aware_result, tuple):
+                layer_ratios, module_ranks = loss_aware_result
+            else:
+                layer_ratios = loss_aware_result
         elif args.use_layerwise_ratio:
             layer_ratios = _obtain_layer_ratios(args, model, None)
         if args.use_loss_aware_layerwise:
