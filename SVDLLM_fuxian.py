@@ -1773,41 +1773,58 @@ def _loss_aware_context_greedy_repair(
     context_topk = int(getattr(args, "loss_aware_context_topk_layers", 0))
     if context_topk <= 0:
         return chosen_idx
+    max_steps = max(1, int(getattr(args, "loss_aware_context_max_steps", 4)))
+    min_gain = max(0.0, float(getattr(args, "loss_aware_context_min_gain", 0.001)))
+    confirm_actions = bool(getattr(args, "loss_aware_context_confirm", True))
 
     n_layers = len(layer_tables)
     chosen_idx = list(chosen_idx)
-    chosen_cost = sum(int(layer_tables[i][chosen_idx[i]]["cost"]) for i in range(n_layers))
-    slack = int(max(0, int(round(target_params)) - chosen_cost))
 
-    up_candidates = []
-    down_candidates = []
-    for li in range(n_layers):
-        ci = int(chosen_idx[li])
-        table = layer_tables[li]
-        cur_delta = float(table[ci]["delta"])
-        if ci + 1 < len(table):
-            up_candidates.append((li, cur_delta))
-        if ci - 1 >= 0:
-            down_candidates.append((li, cur_delta))
-    if not up_candidates and not down_candidates:
-        return chosen_idx
+    def _active_layers_for_current_choice():
+        up_candidates = []
+        down_candidates = []
+        for layer_id in range(n_layers):
+            ci = int(chosen_idx[layer_id])
+            table = layer_tables[layer_id]
+            cur_delta = float(table[ci].get("raw_delta", table[ci]["delta"]))
+            if ci + 1 < len(table):
+                up_candidates.append((layer_id, cur_delta))
+            if ci - 1 >= 0:
+                down_candidates.append((layer_id, cur_delta))
+        up_layers_i = [
+            li for li, _ in sorted(up_candidates, key=lambda x: x[1], reverse=True)[:context_topk]
+        ]
+        down_layers_i = [
+            li for li, _ in sorted(down_candidates, key=lambda x: x[1])[:context_topk]
+        ]
+        return sorted(set(up_layers_i + down_layers_i)), up_layers_i, down_layers_i
 
-    up_layers = [li for li, _ in sorted(up_candidates, key=lambda x: x[1], reverse=True)[:context_topk]]
-    down_layers = [li for li, _ in sorted(down_candidates, key=lambda x: x[1])[:context_topk]]
-    active_layers = sorted(set(up_layers + down_layers))
+    active_layers, _, _ = _active_layers_for_current_choice()
     if not active_layers:
         return chosen_idx
 
-    active_backups = {}
-    for li in active_layers:
+    # Full-context means all layers are temporarily compressed at the current
+    # chosen ratios before evaluating up/down/swap moves.  Back up all layer
+    # Linear weights so this repair leaves the model untouched for the later
+    # simultaneous local update.
+    all_backups = {}
+    for li in range(n_layers):
         subset = find_layers(layers[li])
-        active_backups[li] = {name: mod.weight.data.detach().cpu().clone() for name, mod in subset.items()}
+        all_backups[li] = {name: mod.weight.data.detach().cpu().clone() for name, mod in subset.items()}
 
-    def _set_layer_ratio_from_backup(layer_id, ratio_i):
+    choice_weight_cache = {}
+
+    def _make_layer_choice_weights(layer_id, choice_idx, cache=True):
+        cache_key = (int(layer_id), int(choice_idx))
+        if cache and cache_key in choice_weight_cache:
+            return choice_weight_cache[cache_key]
+
         layer = layers[layer_id]
         subset = find_layers(layer)
         profile_layer = profiling_mat[layer_id] if (profiling_mat is not None and layer_id in profiling_mat) else None
-        bkp = active_backups[layer_id]
+        bkp = all_backups[layer_id]
+        ratio_i = float(layer_tables[layer_id][choice_idx]["ratio"])
+        weight_map = {}
         for name, mod in subset.items():
             W = bkp[name].to(mod.weight.device, dtype=torch.float32)
             scaling_inv = None
@@ -1835,125 +1852,197 @@ def _loss_aware_context_greedy_repair(
             if scaling_inv is not None:
                 truc_v = torch.matmul(truc_v, scaling_inv)
             w_hat = torch.matmul(truc_u * truc_s.unsqueeze(0), truc_v)
-            mod.weight.data.copy_(w_hat.to(mod.weight.device, dtype=mod.weight.dtype))
+            weight_map[name] = w_hat.detach().cpu().to(dtype=bkp[name].dtype)
+            W = scaling_inv = W_scale = U = S = VT = truc_u = truc_s = truc_v = w_hat = None
+            del W, scaling_inv, W_scale, U, S, VT, truc_u, truc_s, truc_v, w_hat
+        if cache:
+            choice_weight_cache[cache_key] = weight_map
+        return weight_map
 
-    def _restore_active_full_weights():
-        for li in active_layers:
+    def _set_layer_choice_from_backup(layer_id, choice_idx, cache=True):
+        subset = find_layers(layers[layer_id])
+        weight_map = _make_layer_choice_weights(layer_id, choice_idx, cache=cache)
+        for name, mod in subset.items():
+            mod.weight.data.copy_(weight_map[name].to(mod.weight.device, dtype=mod.weight.dtype))
+
+    def _set_all_current_choices():
+        active_now = set(active_layers)
+        for layer_id in range(n_layers):
+            _set_layer_choice_from_backup(
+                layer_id,
+                int(chosen_idx[layer_id]),
+                cache=(layer_id in active_now),
+            )
+
+    def _restore_all_full_weights():
+        for li in range(n_layers):
             subset = find_layers(layers[li])
-            bkp = active_backups[li]
+            bkp = all_backups[li]
             for name, mod in subset.items():
                 mod.weight.data.copy_(bkp[name].to(mod.weight.device, dtype=mod.weight.dtype))
 
     try:
-        # Build a partial compressed context on active layers only.
-        for li in active_layers:
-            ci = int(chosen_idx[li])
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ci]["ratio"]))
-        base_ctx_loss = _eval_calib_loss(
+        _set_all_current_choices()
+        cur_ctx_loss = _eval_calib_loss(
             model,
             eval_data,
             args.DEV,
             max_batches=context_batches,
             use_autocast_bf16=use_autocast_bf16,
         )
+        print(
+            f"[loss-aware-context] full-context repair: compressed_layers={n_layers}, "
+            f"active_topk={context_topk}, batches={context_batches}, "
+            f"max_steps={max_steps}, min_gain={min_gain:.6f}, base_loss={cur_ctx_loss:.6f}"
+        )
 
-        up_props = []
-        for li in up_layers:
-            ci = int(chosen_idx[li])
-            ni = ci + 1
-            if ni >= len(layer_tables[li]):
-                continue
-            c0 = int(layer_tables[li][ci]["cost"])
-            c1 = int(layer_tables[li][ni]["cost"])
-            extra_cost = c1 - c0
-            if extra_cost <= 0:
-                continue
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ni]["ratio"]))
-            loss_up = _eval_calib_loss(
-                model,
-                eval_data,
-                args.DEV,
-                max_batches=context_batches,
-                use_autocast_bf16=use_autocast_bf16,
-            )
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ci]["ratio"]))
-            gain = float(base_ctx_loss - loss_up)
-            up_props.append({
-                "layer": li,
-                "next_idx": ni,
-                "extra_cost": int(extra_cost),
-                "gain": float(gain),
-            })
+        for step_id in range(max_steps):
+            chosen_cost = sum(int(layer_tables[i][chosen_idx[i]]["cost"]) for i in range(n_layers))
+            slack = int(max(0, int(round(target_params)) - chosen_cost))
+            active_layers, up_layers, down_layers = _active_layers_for_current_choice()
+            if not active_layers:
+                break
 
-        down_props = []
-        for li in down_layers:
-            ci = int(chosen_idx[li])
-            ni = ci - 1
-            if ni < 0:
-                continue
-            c0 = int(layer_tables[li][ci]["cost"])
-            c1 = int(layer_tables[li][ni]["cost"])
-            free_cost = c0 - c1
-            if free_cost <= 0:
-                continue
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ni]["ratio"]))
-            loss_down = _eval_calib_loss(
-                model,
-                eval_data,
-                args.DEV,
-                max_batches=context_batches,
-                use_autocast_bf16=use_autocast_bf16,
-            )
-            _set_layer_ratio_from_backup(li, float(layer_tables[li][ci]["ratio"]))
-            harm = float(loss_down - base_ctx_loss)
-            down_props.append({
-                "layer": li,
-                "next_idx": ni,
-                "free_cost": int(free_cost),
-                "harm": float(harm),
-            })
+            up_props = []
+            for li in up_layers:
+                ci = int(chosen_idx[li])
+                ni = ci + 1
+                if ni >= len(layer_tables[li]):
+                    continue
+                c0 = int(layer_tables[li][ci]["cost"])
+                c1 = int(layer_tables[li][ni]["cost"])
+                extra_cost = c1 - c0
+                if extra_cost <= 0:
+                    continue
+                _set_layer_choice_from_backup(li, ni)
+                loss_up = _eval_calib_loss(
+                    model,
+                    eval_data,
+                    args.DEV,
+                    max_batches=context_batches,
+                    use_autocast_bf16=use_autocast_bf16,
+                )
+                _set_layer_choice_from_backup(li, ci)
+                gain = float(cur_ctx_loss - loss_up)
+                up_props.append({
+                    "layer": li,
+                    "next_idx": ni,
+                    "extra_cost": int(extra_cost),
+                    "gain": gain,
+                })
 
-        best_action = None
-        for up in up_props:
-            if up["extra_cost"] <= slack and up["gain"] > 0:
-                score = float(up["gain"])
-                if best_action is None or score > best_action["score"]:
-                    best_action = {"type": "up", "up": up, "score": score}
-        for up in up_props:
+            down_props = []
+            for li in down_layers:
+                ci = int(chosen_idx[li])
+                ni = ci - 1
+                if ni < 0:
+                    continue
+                c0 = int(layer_tables[li][ci]["cost"])
+                c1 = int(layer_tables[li][ni]["cost"])
+                free_cost = c0 - c1
+                if free_cost <= 0:
+                    continue
+                _set_layer_choice_from_backup(li, ni)
+                loss_down = _eval_calib_loss(
+                    model,
+                    eval_data,
+                    args.DEV,
+                    max_batches=context_batches,
+                    use_autocast_bf16=use_autocast_bf16,
+                )
+                _set_layer_choice_from_backup(li, ci)
+                harm = float(loss_down - cur_ctx_loss)
+                down_props.append({
+                    "layer": li,
+                    "next_idx": ni,
+                    "free_cost": int(free_cost),
+                    "harm": harm,
+                })
+
+            best_action = None
+            for up in up_props:
+                if up["extra_cost"] <= slack and up["gain"] >= min_gain:
+                    if best_action is None or up["gain"] > best_action["score"]:
+                        best_action = {"type": "up", "up": up, "score": float(up["gain"])}
             for down in down_props:
-                if up["layer"] == down["layer"]:
-                    continue
-                if up["extra_cost"] > slack + down["free_cost"]:
-                    continue
-                net = float(up["gain"] - down["harm"])
-                if net <= 0:
-                    continue
-                if best_action is None or net > best_action["score"]:
-                    best_action = {"type": "swap", "up": up, "down": down, "score": net}
+                gain = -float(down["harm"])
+                if gain >= min_gain:
+                    if best_action is None or gain > best_action["score"]:
+                        best_action = {"type": "down", "down": down, "score": gain}
+            for up in up_props:
+                for down in down_props:
+                    if up["layer"] == down["layer"]:
+                        continue
+                    if up["extra_cost"] > slack + down["free_cost"]:
+                        continue
+                    net = float(up["gain"] - down["harm"])
+                    if net < min_gain:
+                        continue
+                    if best_action is None or net > best_action["score"]:
+                        best_action = {"type": "swap", "up": up, "down": down, "score": net}
 
-        if best_action is not None:
+            if best_action is None:
+                print(f"[loss-aware-context] stop at step {step_id}: no action above min_gain.")
+                break
+
+            old_idx = list(chosen_idx)
             if best_action["type"] == "up":
                 up = best_action["up"]
                 chosen_idx[up["layer"]] = int(up["next_idx"])
-                print(
-                    f"[loss-aware-context] apply up: layer {up['layer']:02d} "
-                    f"gain={up['gain']:+.6f} extra_cost={up['extra_cost']} (slack={slack})"
-                )
+            elif best_action["type"] == "down":
+                down = best_action["down"]
+                chosen_idx[down["layer"]] = int(down["next_idx"])
             else:
                 up = best_action["up"]
                 down = best_action["down"]
                 chosen_idx[up["layer"]] = int(up["next_idx"])
                 chosen_idx[down["layer"]] = int(down["next_idx"])
+
+            _set_all_current_choices()
+            new_ctx_loss = _eval_calib_loss(
+                model,
+                eval_data,
+                args.DEV,
+                max_batches=context_batches,
+                use_autocast_bf16=use_autocast_bf16,
+            )
+            actual_gain = float(cur_ctx_loss - new_ctx_loss)
+            if confirm_actions and actual_gain < min_gain:
+                chosen_idx = old_idx
+                _set_all_current_choices()
                 print(
-                    f"[loss-aware-context] apply swap: up layer {up['layer']:02d} "
-                    f"gain={up['gain']:+.6f} + down layer {down['layer']:02d} "
-                    f"harm={down['harm']:+.6f} net={best_action['score']:+.6f}"
+                    f"[loss-aware-context] reject step {step_id}: "
+                    f"pred={best_action['score']:+.6f} actual={actual_gain:+.6f}"
                 )
-        else:
-            print("[loss-aware-context] no positive one-step repair found.")
+                break
+
+            cur_ctx_loss = new_ctx_loss
+            if best_action["type"] == "up":
+                up = best_action["up"]
+                print(
+                    f"[loss-aware-context] step {step_id} apply up: layer {up['layer']:02d} "
+                    f"gain={actual_gain:+.6f} pred={best_action['score']:+.6f} "
+                    f"extra_cost={up['extra_cost']} slack={slack}"
+                )
+            elif best_action["type"] == "down":
+                down = best_action["down"]
+                print(
+                    f"[loss-aware-context] step {step_id} apply down: layer {down['layer']:02d} "
+                    f"gain={actual_gain:+.6f} pred={best_action['score']:+.6f} "
+                    f"free_cost={down['free_cost']}"
+                )
+            else:
+                up = best_action["up"]
+                down = best_action["down"]
+                print(
+                    f"[loss-aware-context] step {step_id} apply swap: up layer {up['layer']:02d} "
+                    f"+ down layer {down['layer']:02d} gain={actual_gain:+.6f} "
+                    f"pred={best_action['score']:+.6f}"
+                )
     finally:
-        _restore_active_full_weights()
-        active_backups.clear()
+        _restore_all_full_weights()
+        all_backups.clear()
+        choice_weight_cache.clear()
         torch.cuda.empty_cache()
     return chosen_idx
 
@@ -1982,6 +2071,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             tokenizer,
             eval_windows,
             seqlen=eval_seq_len,
+            seed=args.seed,
             batch_size=eval_batch,
         )
     if len(eval_data) > eval_nsamples:
@@ -2029,6 +2119,9 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             f"[loss-aware] early-stop enabled: margin={early_stop_margin:.6f}, "
             f"min_batches={early_stop_min_batches}"
         )
+    ratio_reg = max(0.0, float(getattr(args, "loss_aware_ratio_reg", 0.0)))
+    if ratio_reg > 0:
+        print(f"[loss-aware] ratio regularization enabled: lambda={ratio_reg:.6f}")
 
     layer_tables = []
     layer_full_sizes = []
@@ -2367,11 +2460,15 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                 early_stop_min_batches=early_stop_min_batches,
             )
             layer_best_loss = min(layer_best_loss, loss_i)
-            delta_i = loss_i - base_loss
+            raw_delta_i = float(loss_i - base_loss)
+            reg_i = float(ratio_reg * ((float(ratio_i) - float(args.ratio)) ** 2))
+            delta_i = raw_delta_i + reg_i
             table.append({
                 "ratio": float(ratio_i),
                 "cost": int(cost_i),
                 "loss": float(loss_i),
+                "raw_delta": float(raw_delta_i),
+                "reg": float(reg_i),
                 "delta": float(delta_i),
             })
         table.sort(key=lambda x: x["ratio"])
@@ -2380,7 +2477,13 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         layer_cache.clear()
         layer_tables.append(table)
         if args.print_layer_ratios:
-            msg = "  ".join([f"r={x['ratio']:.4f}:Δ={x['delta']:+.5f}" for x in table])
+            if ratio_reg > 0:
+                msg = "  ".join([
+                    f"r={x['ratio']:.4f}:Δ={x['raw_delta']:+.5f}/obj={x['delta']:+.5f}"
+                    for x in table
+                ])
+            else:
+                msg = "  ".join([f"r={x['ratio']:.4f}:Δ={x['delta']:+.5f}" for x in table])
             print(f"[loss-aware] layer {li:02d} {msg}")
 
     total_full = sum(layer_full_sizes)
@@ -2391,6 +2494,31 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         total_full,
         dp_bins=args.loss_aware_dp_bins,
     )
+    if bool(getattr(args, "loss_aware_uniform_guard", False)):
+        uniform_idx = [
+            min(range(len(table)), key=lambda ci: abs(float(table[ci]["ratio"]) - float(args.ratio)))
+            for table in layer_tables
+        ]
+        chosen_raw_delta = sum(
+            float(layer_tables[i][chosen_idx[i]].get("raw_delta", layer_tables[i][chosen_idx[i]]["delta"]))
+            for i in range(len(layer_tables))
+        )
+        uniform_raw_delta = sum(
+            float(layer_tables[i][uniform_idx[i]].get("raw_delta", layer_tables[i][uniform_idx[i]]["delta"]))
+            for i in range(len(layer_tables))
+        )
+        guard_margin = max(0.0, float(getattr(args, "loss_aware_uniform_guard_margin", 0.002)))
+        if chosen_raw_delta >= uniform_raw_delta - guard_margin:
+            print(
+                f"[loss-aware] uniform guard fallback: dp_raw_delta={chosen_raw_delta:+.6f}, "
+                f"uniform_raw_delta={uniform_raw_delta:+.6f}, margin={guard_margin:.6f}"
+            )
+            chosen_idx = uniform_idx
+        else:
+            print(
+                f"[loss-aware] uniform guard keep DP: dp_raw_delta={chosen_raw_delta:+.6f}, "
+                f"uniform_raw_delta={uniform_raw_delta:+.6f}, margin={guard_margin:.6f}"
+            )
     chosen_idx = _loss_aware_context_greedy_repair(
         args,
         model,
@@ -2404,13 +2532,18 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
     chosen_ratios = [layer_tables[i][chosen_idx[i]]["ratio"] for i in range(len(layer_tables))]
     chosen_cost = sum(layer_tables[i][chosen_idx[i]]["cost"] for i in range(len(layer_tables)))
     chosen_delta = sum(layer_tables[i][chosen_idx[i]]["delta"] for i in range(len(layer_tables)))
+    chosen_raw_delta = sum(
+        float(layer_tables[i][chosen_idx[i]].get("raw_delta", layer_tables[i][chosen_idx[i]]["delta"]))
+        for i in range(len(layer_tables))
+    )
     print(f"[loss-aware] selected effective_ratio={chosen_cost/max(total_full,1):.6f} "
-          f"(target={args.ratio:.6f})  total_delta={chosen_delta:+.6f}")
+          f"(target={args.ratio:.6f})  total_delta={chosen_raw_delta:+.6f} "
+          f"objective={chosen_delta:+.6f}")
     if args.print_layer_ratios:
         for li, ratio_i in enumerate(chosen_ratios):
             info = layer_tables[li][chosen_idx[li]]
             print(f"[loss-aware] layer {li:02d} ratio={ratio_i:.6f} "
-                  f"cost={info['cost']} delta={info['delta']:+.6f}")
+                  f"cost={info['cost']} delta={info.get('raw_delta', info['delta']):+.6f}")
 
     if str(prev_device) == "cpu":
         model = model.cpu()
@@ -2980,12 +3113,24 @@ if __name__ == '__main__':
         help='Minimum number of batches evaluated before early-stop can trigger.')
     parser.add_argument('--loss_aware_dp_bins', type=int, default=2000,
         help='DP budget bins for loss-aware layerwise allocation (larger = finer budget match, slower DP).')
+    parser.add_argument('--loss_aware_ratio_reg', type=float, default=0.0,
+        help='Penalty added to DP objective for moving layer ratio away from --ratio: lambda * (candidate_ratio - ratio)^2.')
+    parser.add_argument('--loss_aware_uniform_guard', action='store_true',
+        help='Fallback to uniform layer ratios when DP does not beat the uniform raw calibration delta by a margin.')
+    parser.add_argument('--loss_aware_uniform_guard_margin', type=float, default=0.002,
+        help='Required raw calibration-loss improvement over uniform before accepting DP allocation.')
     parser.add_argument('--loss_aware_context_greedy_repair', action='store_true',
-        help='After DP, run one-step greedy repair under compressed-context proxy (budget-aware).')
+        help='After DP, run conservative multi-step full-context greedy repair (budget-aware).')
     parser.add_argument('--loss_aware_context_batches', type=int, default=4,
         help='Calibration batches used by context greedy repair.')
     parser.add_argument('--loss_aware_context_topk_layers', type=int, default=8,
         help='Top-k sensitive layers considered by context greedy repair.')
+    parser.add_argument('--loss_aware_context_max_steps', type=int, default=4,
+        help='Maximum number of full-context repair actions.')
+    parser.add_argument('--loss_aware_context_min_gain', type=float, default=0.001,
+        help='Minimum confirmed calibration-loss gain required for each full-context repair action.')
+    parser.add_argument('--loss_aware_context_confirm', action=argparse.BooleanOptionalAction, default=True,
+        help='Confirm each predicted repair action by re-evaluating the full compressed context before accepting it.')
     parser.add_argument('--loss_aware_modulewise_refine', action='store_true',
         help='After selecting layerwise ratios, reallocate ranks within each layer budget across modules by spectral cost-effectiveness.')
     parser.add_argument('--use_module_rank_allocation', action='store_true', help='Allocate per-module ranks via spectrum + Lagrange')
@@ -3058,7 +3203,7 @@ if __name__ == '__main__':
         module_ranks = None
         cali_white_data = None
         if args.profiling_mat_path is None:
-            cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
+            cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len, seed=args.seed)
             profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
@@ -3114,7 +3259,7 @@ if __name__ == '__main__':
         module_ranks = None
         cali_white_data = None
         if args.profiling_mat_path is None:
-            cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
+            cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len, seed=args.seed)
             profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
