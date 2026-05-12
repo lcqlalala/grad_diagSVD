@@ -771,11 +771,16 @@ def whitening(
         if "llama" in model_name or "vicuna" in model_name:
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = svd_attn.to(dev)
+            svd_mlp = svd_mlp.to(dev)
         elif "mistral" in model_name:
             svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn = svd_attn.to(dev)
+            svd_mlp = svd_mlp.to(dev)
         elif 'opt' in model_name:
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio_i, ranks=ranks_layer if ranks_layer else None)
+            svd_decoder = svd_decoder.to(dev)
         #### Replace Attn, MLP ####
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
@@ -924,10 +929,15 @@ def whitening_local_update(
     bi_sigma_eps=1e-6,
     print_layer_rank_detail=False,
     update_layer_batch_size=1,
+    local_update_mode="simultaneous",
 ):
+    local_update_mode = str(local_update_mode)
+    if local_update_mode not in ("simultaneous", "true_sequential"):
+        raise ValueError(f"Unsupported local_update_mode={local_update_mode}")
     print("Start SVD decomposition then update "
           f"(bi_closed_form={use_bi_closed_form}, weighted={use_weighted_update}, "
-          f"weight_mode={bi_weight_mode}, layer_batch_size={update_layer_batch_size})...")
+          f"weight_mode={bi_weight_mode}, layer_batch_size={update_layer_batch_size}, "
+          f"mode={local_update_mode})...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
     if "opt" in model_name:
@@ -1061,18 +1071,8 @@ def whitening_local_update(
             def tmp(_, inp, out):
                 gpts[name].add_batch_update_u(inp[0].data, out.data)
             return tmp
-        handles = []
-        for name in gpts:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
-        if "opt" not in model_name:
-            outs = _layer_forward_chunked(layer, inps, attention_masks, position_ids)
-        else:
-            outs = _layer_forward_chunked(layer, inps, attention_masks, None)
-        for h in handles:
-            h.remove()
-        for name in gpts:
-            svd_u, svd_v = gpts[name].fasterprune()
-            svd_u, svd_v = svd_u.to(dtype), svd_v.to(dtype)
+
+        def _assign_svd_factor(name, svd_u, svd_v):
             if 'opt' in model_name:
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
@@ -1120,6 +1120,95 @@ def whitening_local_update(
                 elif "up_proj" in name:
                     svd_mlp.up_u_proj.weight.data = svd_u
                     svd_mlp.up_v_proj.weight.data = svd_v
+
+        def _base_svd_factor(name):
+            sqrt_sigma = torch.sqrt(gpts[name].truc_sigma)
+            svd_u = gpts[name].truc_u.matmul(sqrt_sigma)
+            svd_v = sqrt_sigma.matmul(gpts[name].truc_v)
+            return svd_u.to(dtype), svd_v.to(dtype)
+
+        def _solve_and_assign(names):
+            for solve_name in names:
+                svd_u, svd_v = gpts[solve_name].fasterprune()
+                _assign_svd_factor(solve_name, svd_u.to(dtype), svd_v.to(dtype))
+
+        def _run_layer_chunks_no_output(layer_mod, hs, attn, pos_ids=None):
+            n = hs.shape[0]
+            for st in range(0, n, update_layer_batch_size):
+                ed = min(n, st + update_layer_batch_size)
+                if "opt" not in model_name:
+                    layer_mod(
+                        hs[st:ed],
+                        attention_mask=attn[st:ed],
+                        position_ids=pos_ids[st:ed],
+                    )
+                else:
+                    layer_mod(
+                        hs[st:ed],
+                        attention_mask=attn[st:ed],
+                    )
+
+        if local_update_mode == "simultaneous" or "opt" in model_name:
+            handles = []
+            for name in gpts:
+                handles.append(subset[name].register_forward_hook(add_batch(name)))
+            if "opt" not in model_name:
+                outs = _layer_forward_chunked(layer, inps, attention_masks, position_ids)
+            else:
+                outs = _layer_forward_chunked(layer, inps, attention_masks, None)
+            for h in handles:
+                h.remove()
+            _solve_and_assign(list(gpts.keys()))
+        else:
+            downstream_names = [
+                n for n in gpts
+                if ("o_proj" in n or "down_proj" in n or "out_proj" in n or "fc2" in n)
+            ]
+            first_names = [n for n in gpts if n not in downstream_names]
+
+            handles = []
+            for name in first_names:
+                handles.append(subset[name].register_forward_hook(add_batch(name)))
+            _run_layer_chunks_no_output(layer, inps, attention_masks, position_ids)
+            for h in handles:
+                h.remove()
+            _solve_and_assign(first_names)
+
+            for name in downstream_names:
+                svd_u, svd_v = _base_svd_factor(name)
+                _assign_svd_factor(name, svd_u, svd_v)
+
+            original_self_attn = layer.self_attn
+            original_mlp = layer.mlp
+            layer.self_attn = svd_attn
+            layer.mlp = svd_mlp
+            for st in range(0, inps.shape[0], update_layer_batch_size):
+                ed = min(inps.shape[0], st + update_layer_batch_size)
+                hs_chunk = inps[st:ed]
+                attn_chunk = attention_masks[st:ed]
+                pos_chunk = position_ids[st:ed]
+                input_handles = []
+                if any("o_proj" in n for n in downstream_names):
+                    def capture_o_input(_, inp, out):
+                        target_name = next((n for n in downstream_names if "o_proj" in n), None)
+                        if target_name is not None:
+                            target = original_self_attn.o_proj(inp[0].detach())
+                            gpts[target_name].add_batch_update_u(inp[0].data, target.data)
+                    input_handles.append(svd_attn.o_v_proj.register_forward_hook(capture_o_input))
+                if any("down_proj" in n for n in downstream_names):
+                    def capture_down_input(_, inp, out):
+                        target_name = next((n for n in downstream_names if "down_proj" in n), None)
+                        if target_name is not None:
+                            target = original_mlp.down_proj(inp[0].detach())
+                            gpts[target_name].add_batch_update_u(inp[0].data, target.data)
+                    input_handles.append(svd_mlp.down_v_proj.register_forward_hook(capture_down_input))
+                layer(hs_chunk, attention_mask=attn_chunk, position_ids=pos_chunk)
+                for h in input_handles:
+                    h.remove()
+
+            _solve_and_assign(downstream_names)
+            layer.self_attn = original_self_attn
+            layer.mlp = original_mlp
         # Replace modules after all weights have been assigned
         if 'opt' in model_name:
             svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
@@ -3239,6 +3328,8 @@ if __name__ == '__main__':
         help='Cast model to fp32 before local update (step 2/3). Default keeps model dtype (e.g. fp16).')
     parser.add_argument('--update_layer_batch_size', type=int, default=1,
         help='Micro-batch size for per-layer forward in local update (step 2/3). Smaller value reduces VRAM peak.')
+    parser.add_argument('--local_update_mode', type=str, default='simultaneous', choices=['simultaneous', 'true_sequential'],
+        help='Local update mode: simultaneous updates all Linear modules from original activations; true_sequential updates o/down from compressed upstream activations.')
     parser.add_argument('--debug_svd', action='store_true', help='Print per-module truncation error and G stats for debugging')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
@@ -3397,6 +3488,7 @@ if __name__ == '__main__':
                 bi_sigma_eps=args.bi_sigma_eps,
                 print_layer_rank_detail=args.print_layer_rank_detail,
                 update_layer_batch_size=args.update_layer_batch_size,
+                local_update_mode=args.local_update_mode,
             )
         if args.save_path is not None:
             if args.disable_simultaneous_update:
@@ -3455,6 +3547,7 @@ if __name__ == '__main__':
             bi_sigma_eps=args.bi_sigma_eps,
             print_layer_rank_detail=args.print_layer_rank_detail,
             update_layer_batch_size=args.update_layer_batch_size,
+            local_update_mode=args.local_update_mode,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')
