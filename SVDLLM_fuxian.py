@@ -2125,7 +2125,60 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
 
     layer_tables = []
     layer_full_sizes = []
-    for li in tqdm(range(len(layers)), desc="loss-aware layers"):
+    table_cache_path = getattr(args, "loss_aware_table_cache_path", None)
+    table_cache_loaded = False
+    table_cache_meta = {
+        "model": args.model,
+        "dataset": args.dataset,
+        "ratio": float(args.ratio),
+        "seed": int(args.seed),
+        "model_seq_len": int(args.model_seq_len),
+        "eval_nsamples": int(eval_nsamples),
+        "eval_seq_len": int(eval_seq_len),
+        "eval_batch": int(eval_batch),
+        "candidates": [float(x) for x in candidates],
+        "two_stage": bool(use_two_stage),
+        "stage1_batches": int(stage1_batches),
+        "stage1_topk": int(stage1_topk),
+        "full_max_batches": int(full_max_batches) if full_max_batches is not None else 0,
+        "loss_aware_modulewise_refine": bool(args.loss_aware_modulewise_refine),
+        "module_rank_max": int(args.module_rank_max) if args.module_rank_max is not None else None,
+        "module_rank_min": int(args.module_rank_min) if args.module_rank_min is not None else None,
+        "module_rank_min_qkv": int(args.module_rank_min_qkv) if args.module_rank_min_qkv is not None else None,
+        "module_rank_min_o": int(args.module_rank_min_o) if args.module_rank_min_o is not None else None,
+        "module_rank_min_mlp": int(args.module_rank_min_mlp) if args.module_rank_min_mlp is not None else None,
+        "module_rank_min_down": int(args.module_rank_min_down) if args.module_rank_min_down is not None else None,
+        "early_layers": int(args.early_layers) if args.early_layers is not None else 0,
+        "early_layers_min_qkv": int(args.early_layers_min_qkv) if args.early_layers_min_qkv is not None else None,
+        "profiling_mat_path": args.profiling_mat_path,
+    }
+    if table_cache_path and os.path.exists(table_cache_path):
+        try:
+            cache_obj = torch.load(table_cache_path, map_location="cpu")
+            if (
+                isinstance(cache_obj, dict)
+                and cache_obj.get("meta") == table_cache_meta
+                and "layer_tables" in cache_obj
+                and "layer_full_sizes" in cache_obj
+            ):
+                layer_tables = cache_obj["layer_tables"]
+                layer_full_sizes = cache_obj["layer_full_sizes"]
+                for table in layer_tables:
+                    for item in table:
+                        raw_delta = float(item.get("raw_delta", item["delta"]))
+                        reg_i = float(ratio_reg * ((float(item["ratio"]) - float(args.ratio)) ** 2))
+                        item["raw_delta"] = raw_delta
+                        item["reg"] = reg_i
+                        item["delta"] = raw_delta + reg_i
+                table_cache_loaded = True
+                print(f"[loss-aware] loaded layer table cache: {table_cache_path}")
+            else:
+                print(f"[loss-aware] table cache meta mismatch, recomputing: {table_cache_path}")
+        except Exception as e:
+            print(f"[loss-aware] WARNING: failed to load table cache ({e}), recomputing.")
+
+    layer_iter = [] if table_cache_loaded else range(len(layers))
+    for li in tqdm(layer_iter, desc="loss-aware layers"):
         layer = layers[li]
         subset = find_layers(layer)
         profiling_layer = profiling_mat[li] if (profiling_mat is not None and li in profiling_mat) else None
@@ -2485,6 +2538,20 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             else:
                 msg = "  ".join([f"r={x['ratio']:.4f}:Δ={x['delta']:+.5f}" for x in table])
             print(f"[loss-aware] layer {li:02d} {msg}")
+
+    if table_cache_path and not table_cache_loaded:
+        cache_dir = os.path.dirname(table_cache_path)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+        torch.save(
+            {
+                "meta": table_cache_meta,
+                "layer_tables": layer_tables,
+                "layer_full_sizes": layer_full_sizes,
+            },
+            table_cache_path,
+        )
+        print(f"[loss-aware] saved layer table cache: {table_cache_path}")
 
     total_full = sum(layer_full_sizes)
     target_params = args.ratio * total_full
@@ -3101,6 +3168,8 @@ if __name__ == '__main__':
         help='Per-layer number of stage-1 best candidates kept for full evaluation (only when --loss_aware_two_stage).')
     parser.add_argument('--loss_aware_eval_max_batches', type=int, default=0,
         help='Cap the number of calibration batches per loss evaluation. 0 means using all available batches.')
+    parser.add_argument('--loss_aware_table_cache_path', type=str, default=None,
+        help='Path to save/load expensive loss-aware per-layer candidate tables. Reused when cache metadata matches.')
     parser.add_argument('--loss_aware_autocast_bf16', action='store_true',
         help='Run loss-aware evaluation forwards under bfloat16 autocast on CUDA for speed.')
     parser.add_argument('--loss_aware_cache_on_device', action='store_true',
