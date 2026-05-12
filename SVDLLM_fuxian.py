@@ -930,6 +930,7 @@ def whitening_local_update(
     print_layer_rank_detail=False,
     update_layer_batch_size=1,
     local_update_mode="simultaneous",
+    local_update_min_rel_gain=5e-3,
 ):
     local_update_mode = str(local_update_mode)
     if local_update_mode not in ("simultaneous", "true_sequential"):
@@ -937,7 +938,7 @@ def whitening_local_update(
     print("Start SVD decomposition then update "
           f"(bi_closed_form={use_bi_closed_form}, weighted={use_weighted_update}, "
           f"weight_mode={bi_weight_mode}, layer_batch_size={update_layer_batch_size}, "
-          f"mode={local_update_mode})...")
+          f"mode={local_update_mode}, min_rel_gain={float(local_update_min_rel_gain):.4g})...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
     if "opt" in model_name:
@@ -1058,6 +1059,7 @@ def whitening_local_update(
                 bi_u_ridge=bi_u_ridge,
                 bi_v_ridge=bi_v_ridge,
                 bi_sigma_eps=bi_sigma_eps,
+                min_rel_gain=local_update_min_rel_gain,
             )
             m, n = int(subset[name].weight.shape[0]), int(subset[name].weight.shape[1])
             rk = int(gpts[name].rank)
@@ -1270,6 +1272,7 @@ class local_update:
         bi_u_ridge=1e-5,
         bi_v_ridge=1e-5,
         bi_sigma_eps=1e-6,
+        min_rel_gain=5e-3,
     ):
         self.layer = layer
         self.name = name
@@ -1283,6 +1286,7 @@ class local_update:
         self.bi_u_ridge = float(bi_u_ridge)
         self.bi_v_ridge = float(bi_v_ridge)
         self.bi_sigma_eps = float(bi_sigma_eps)
+        self.min_rel_gain = max(0.0, float(min_rel_gain))
         # Keep model weights in original dtype (e.g. fp16), but run closed-form
         # solves in fp32 for numerical stability and dtype consistency.
         W = layer.weight.data.detach().to(self.dev, dtype=torch.float32).clone()
@@ -1513,7 +1517,7 @@ class local_update:
             def _is_better(new_val, old_val):
                 tol = max(1e-6, 1e-4 * max(1.0, old_val))
                 return new_val < (old_val - tol)
-            min_rel_gain = 5e-3  # require at least 0.5% holdout SSE gain
+            min_rel_gain = self.min_rel_gain
 
             base_uT = self.truc_u.t()
             base_v = self.truc_v
@@ -3330,6 +3334,8 @@ if __name__ == '__main__':
         help='Micro-batch size for per-layer forward in local update (step 2/3). Smaller value reduces VRAM peak.')
     parser.add_argument('--local_update_mode', type=str, default='simultaneous', choices=['simultaneous', 'true_sequential'],
         help='Local update mode: simultaneous updates all Linear modules from original activations; true_sequential updates o/down from compressed upstream activations.')
+    parser.add_argument('--local_update_min_rel_gain', type=float, default=5e-3,
+        help='Minimum relative holdout SSE gain required to accept u_only/bi_side local update candidates. Lower values accept more corrections.')
     parser.add_argument('--debug_svd', action='store_true', help='Print per-module truncation error and G stats for debugging')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
@@ -3489,6 +3495,7 @@ if __name__ == '__main__':
                 print_layer_rank_detail=args.print_layer_rank_detail,
                 update_layer_batch_size=args.update_layer_batch_size,
                 local_update_mode=args.local_update_mode,
+                local_update_min_rel_gain=args.local_update_min_rel_gain,
             )
         if args.save_path is not None:
             if args.disable_simultaneous_update:
@@ -3548,6 +3555,7 @@ if __name__ == '__main__':
             print_layer_rank_detail=args.print_layer_rank_detail,
             update_layer_batch_size=args.update_layer_batch_size,
             local_update_mode=args.local_update_mode,
+            local_update_min_rel_gain=args.local_update_min_rel_gain,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')
