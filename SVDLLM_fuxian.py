@@ -931,14 +931,29 @@ def whitening_local_update(
     update_layer_batch_size=1,
     local_update_mode="simultaneous",
     local_update_min_rel_gain=5e-3,
+    propagation_aware_update=False,
+    propagation_aware_targets="o,down",
+    propagation_aware_alpha=1.0,
+    propagation_aware_gate_margin=0.0,
+    propagation_aware_max_batches=0,
 ):
     local_update_mode = str(local_update_mode)
     if local_update_mode not in ("simultaneous", "true_sequential"):
         raise ValueError(f"Unsupported local_update_mode={local_update_mode}")
+    propagation_aware_update = bool(propagation_aware_update)
+    propagation_aware_alpha = float(propagation_aware_alpha)
+    propagation_aware_gate_margin = max(0.0, float(propagation_aware_gate_margin))
+    propagation_aware_max_batches = max(0, int(propagation_aware_max_batches))
+    propagation_aware_target_set = {
+        x.strip().lower()
+        for x in str(propagation_aware_targets).replace(";", ",").split(",")
+        if x.strip()
+    }
     print("Start SVD decomposition then update "
           f"(bi_closed_form={use_bi_closed_form}, weighted={use_weighted_update}, "
           f"weight_mode={bi_weight_mode}, layer_batch_size={update_layer_batch_size}, "
-          f"mode={local_update_mode}, min_rel_gain={float(local_update_min_rel_gain):.4g})...")
+          f"mode={local_update_mode}, min_rel_gain={float(local_update_min_rel_gain):.4g}, "
+          f"propagation_aware={propagation_aware_update})...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
     if "opt" in model_name:
@@ -1134,6 +1149,174 @@ def whitening_local_update(
                 svd_u, svd_v = gpts[solve_name].fasterprune()
                 _assign_svd_factor(solve_name, svd_u.to(dtype), svd_v.to(dtype))
 
+        def _get_svd_pair(name):
+            if 'opt' in model_name:
+                if "out_proj" in name:
+                    return svd_decoder.self_attn.out_u_proj, svd_decoder.self_attn.out_v_proj
+                if "fc2" in name:
+                    return svd_decoder.fc2_u_proj, svd_decoder.fc2_v_proj
+                return None, None
+            if "o_proj" in name:
+                return svd_attn.o_u_proj, svd_attn.o_v_proj
+            if "down_proj" in name:
+                return svd_mlp.down_u_proj, svd_mlp.down_v_proj
+            return None, None
+
+        def _propagation_target_kind(name):
+            if "o_proj" in name or "out_proj" in name:
+                return "o"
+            if "down_proj" in name or "fc2" in name:
+                return "down"
+            return None
+
+        def _propagation_aware_refine():
+            if not propagation_aware_update:
+                return
+            if "opt" in model_name:
+                if debug_svd:
+                    print(f"[prop-aware] layer {i:02d}: skip OPT path for now.")
+                return
+            target_names = []
+            for cand_name in gpts:
+                kind = _propagation_target_kind(cand_name)
+                if kind is not None and kind in propagation_aware_target_set:
+                    target_names.append(cand_name)
+            if not target_names:
+                return
+
+            for cand_name in target_names:
+                gpts[cand_name].reset_update_stats()
+
+            backup = {}
+            for cand_name in target_names:
+                u_mod, v_mod = _get_svd_pair(cand_name)
+                if u_mod is not None and v_mod is not None:
+                    backup[cand_name] = (
+                        u_mod.weight.data.detach().clone(),
+                        v_mod.weight.data.detach().clone(),
+                    )
+
+            original_self_attn = layer.self_attn
+            original_mlp = layer.mlp
+            max_batches = inps.shape[0]
+            if propagation_aware_max_batches > 0:
+                max_batches = min(max_batches, propagation_aware_max_batches)
+            base_sse = 0.0
+            base_count = 0
+            alpha = max(0.0, propagation_aware_alpha)
+
+            for st in range(0, max_batches, update_layer_batch_size):
+                ed = min(max_batches, st + update_layer_batch_size)
+                hs_chunk = inps[st:ed]
+                attn_chunk = attention_masks[st:ed]
+                pos_chunk = position_ids[st:ed] if "opt" not in model_name else None
+                full_targets = {}
+                full_handles = []
+
+                if any(_propagation_target_kind(n) == "o" for n in target_names):
+                    def save_full_o(_, inp, out):
+                        full_targets["o"] = out.detach()
+                    full_handles.append(original_self_attn.o_proj.register_forward_hook(save_full_o))
+                if any(_propagation_target_kind(n) == "down" for n in target_names):
+                    def save_full_down(_, inp, out):
+                        full_targets["down"] = out.detach()
+                    full_handles.append(original_mlp.down_proj.register_forward_hook(save_full_down))
+
+                full_out = layer(
+                    hs_chunk,
+                    attention_mask=attn_chunk,
+                    position_ids=pos_chunk,
+                )[0].detach()
+                for h in full_handles:
+                    h.remove()
+
+                layer.self_attn = svd_attn
+                layer.mlp = svd_mlp
+                comp_handles = []
+
+                for cand_name in target_names:
+                    kind = _propagation_target_kind(cand_name)
+                    u_mod, v_mod = _get_svd_pair(cand_name)
+                    if u_mod is None or v_mod is None or kind not in full_targets:
+                        continue
+
+                    def make_capture(name, kind_key, u_layer):
+                        def capture(_, inp, out):
+                            base_out = u_layer(out.detach())
+                            full_tgt = full_targets[kind_key].to(base_out.device, dtype=base_out.dtype)
+                            target = base_out + alpha * (full_tgt - base_out)
+                            gpts[name].add_batch_update_u(inp[0].data, target.data)
+                        return capture
+
+                    comp_handles.append(v_mod.register_forward_hook(make_capture(cand_name, kind, u_mod)))
+
+                comp_out = layer(
+                    hs_chunk,
+                    attention_mask=attn_chunk,
+                    position_ids=pos_chunk,
+                )[0].detach()
+                for h in comp_handles:
+                    h.remove()
+                layer.self_attn = original_self_attn
+                layer.mlp = original_mlp
+
+                base_sse += float(torch.sum((comp_out.float() - full_out.float()) ** 2).item())
+                base_count += int(full_out.numel())
+
+            if base_count <= 0:
+                layer.self_attn = original_self_attn
+                layer.mlp = original_mlp
+                return
+
+            _solve_and_assign(target_names)
+            layer.self_attn = svd_attn
+            layer.mlp = svd_mlp
+
+            new_sse = 0.0
+            new_count = 0
+            for st in range(0, max_batches, update_layer_batch_size):
+                ed = min(max_batches, st + update_layer_batch_size)
+                hs_chunk = inps[st:ed]
+                attn_chunk = attention_masks[st:ed]
+                pos_chunk = position_ids[st:ed] if "opt" not in model_name else None
+                layer.self_attn = original_self_attn
+                layer.mlp = original_mlp
+                full_out = layer(
+                    hs_chunk,
+                    attention_mask=attn_chunk,
+                    position_ids=pos_chunk,
+                )[0].detach()
+                layer.self_attn = svd_attn
+                layer.mlp = svd_mlp
+                comp_out = layer(
+                    hs_chunk,
+                    attention_mask=attn_chunk,
+                    position_ids=pos_chunk,
+                )[0].detach()
+                new_sse += float(torch.sum((comp_out.float() - full_out.float()) ** 2).item())
+                new_count += int(full_out.numel())
+
+            accept = new_sse < base_sse * (1.0 - propagation_aware_gate_margin)
+            if debug_svd or propagation_aware_update:
+                base_mse = base_sse / max(1, base_count)
+                new_mse = new_sse / max(1, new_count)
+                status = "accept" if accept else "reject"
+                print(
+                    f"[prop-aware] layer {i:02d}: {status} "
+                    f"targets={','.join(target_names)} "
+                    f"base_mse={base_mse:.6e} new_mse={new_mse:.6e} "
+                    f"rel={(base_mse - new_mse) / max(base_mse, 1e-12):+.4e}"
+                )
+            if not accept:
+                for cand_name, (u_w, v_w) in backup.items():
+                    u_mod, v_mod = _get_svd_pair(cand_name)
+                    if u_mod is not None and v_mod is not None:
+                        u_mod.weight.data.copy_(u_w)
+                        v_mod.weight.data.copy_(v_w)
+
+            layer.self_attn = original_self_attn
+            layer.mlp = original_mlp
+
         def _run_layer_chunks_no_output(layer_mod, hs, attn, pos_ids=None):
             n = hs.shape[0]
             for st in range(0, n, update_layer_batch_size):
@@ -1211,6 +1394,7 @@ def whitening_local_update(
             _solve_and_assign(downstream_names)
             layer.self_attn = original_self_attn
             layer.mlp = original_mlp
+        _propagation_aware_refine()
         # Replace modules after all weights have been assigned
         if 'opt' in model_name:
             svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
@@ -1349,6 +1533,16 @@ class local_update:
         self._acc_base_err_sq = 0.0
         # Holdout statistics for model selection (base / u_only / bi_side).
         # Fit uses _acc_*, selection prefers _sel_* when available.
+        self._sel_xx = None
+        self._sel_xy = None
+        self._sel_out_sq = 0.0
+        self._solved_once = False
+
+    def reset_update_stats(self):
+        self._acc_xx = None
+        self._acc_xy = None
+        self._acc_out_sq = 0.0
+        self._acc_base_err_sq = 0.0
         self._sel_xx = None
         self._sel_xy = None
         self._sel_out_sq = 0.0
@@ -3484,6 +3678,16 @@ if __name__ == '__main__':
         help='Local update mode: simultaneous updates all Linear modules from original activations; true_sequential updates o/down from compressed upstream activations.')
     parser.add_argument('--local_update_min_rel_gain', type=float, default=5e-3,
         help='Minimum relative holdout SSE gain required to accept u_only/bi_side local update candidates. Lower values accept more corrections.')
+    parser.add_argument('--propagation_aware_update', action='store_true',
+        help='Enable propagation-aware residual-distillation local update for selected downstream projections, gated by full layer output MSE.')
+    parser.add_argument('--propagation_aware_targets', type=str, default='o,down',
+        help='Comma-separated propagation-aware target module groups: o,down. Default updates o_proj and down_proj candidates.')
+    parser.add_argument('--propagation_aware_alpha', type=float, default=1.0,
+        help='Blend strength for propagation-aware targets: target = compressed_output + alpha * (full_output - compressed_output).')
+    parser.add_argument('--propagation_aware_gate_margin', type=float, default=0.0,
+        help='Require this relative full-layer MSE improvement to accept propagation-aware candidate. 0 accepts any strict improvement.')
+    parser.add_argument('--propagation_aware_max_batches', type=int, default=0,
+        help='Max calibration batches per layer for propagation-aware refinement/gate. 0 uses all local-update batches.')
     parser.add_argument('--debug_svd', action='store_true', help='Print per-module truncation error and G stats for debugging')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
@@ -3644,6 +3848,11 @@ if __name__ == '__main__':
                 update_layer_batch_size=args.update_layer_batch_size,
                 local_update_mode=args.local_update_mode,
                 local_update_min_rel_gain=args.local_update_min_rel_gain,
+                propagation_aware_update=args.propagation_aware_update,
+                propagation_aware_targets=args.propagation_aware_targets,
+                propagation_aware_alpha=args.propagation_aware_alpha,
+                propagation_aware_gate_margin=args.propagation_aware_gate_margin,
+                propagation_aware_max_batches=args.propagation_aware_max_batches,
             )
         if args.save_path is not None:
             if args.disable_simultaneous_update:
@@ -3704,6 +3913,11 @@ if __name__ == '__main__':
             update_layer_batch_size=args.update_layer_batch_size,
             local_update_mode=args.local_update_mode,
             local_update_min_rel_gain=args.local_update_min_rel_gain,
+            propagation_aware_update=args.propagation_aware_update,
+            propagation_aware_targets=args.propagation_aware_targets,
+            propagation_aware_alpha=args.propagation_aware_alpha,
+            propagation_aware_gate_margin=args.propagation_aware_gate_margin,
+            propagation_aware_max_batches=args.propagation_aware_max_batches,
         )
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')
