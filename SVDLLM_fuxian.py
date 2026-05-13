@@ -1698,6 +1698,74 @@ def _eval_calib_loss(
     return total_loss / total_tokens
 
 
+def _format_cache_value_for_log(val, max_len=160):
+    text = repr(val)
+    if len(text) > max_len:
+        return text[:max_len - 3] + "..."
+    return text
+
+
+def _values_equal_for_cache_meta(a, b, float_tol=1e-12):
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            return abs(float(a) - float(b)) <= float_tol
+        except Exception:
+            return False
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        if len(a) != len(b):
+            return False
+        return all(_values_equal_for_cache_meta(x, y, float_tol=float_tol) for x, y in zip(a, b))
+    return a == b
+
+
+def _print_loss_aware_table_cache_mismatch(cache_obj, expected_meta, cache_path, max_diffs=64):
+    print(f"[loss-aware] table cache mismatch detail: {cache_path}")
+    if not isinstance(cache_obj, dict):
+        print(f"[loss-aware]   cache object type mismatch: got={type(cache_obj).__name__}, expected=dict")
+        return
+
+    for required_key in ("meta", "layer_tables", "layer_full_sizes"):
+        if required_key not in cache_obj:
+            print(f"[loss-aware]   missing cache key: {required_key}")
+
+    actual_meta = cache_obj.get("meta")
+    if not isinstance(actual_meta, dict):
+        print(
+            f"[loss-aware]   meta type mismatch: "
+            f"got={type(actual_meta).__name__}, expected=dict"
+        )
+        return
+
+    actual_keys = set(actual_meta.keys())
+    expected_keys = set(expected_meta.keys())
+    missing_keys = sorted(expected_keys - actual_keys)
+    extra_keys = sorted(actual_keys - expected_keys)
+    for key in missing_keys:
+        print(f"[loss-aware]   meta missing key: {key} expected={_format_cache_value_for_log(expected_meta[key])}")
+    for key in extra_keys:
+        print(f"[loss-aware]   meta extra key: {key} actual={_format_cache_value_for_log(actual_meta[key])}")
+
+    diffs = []
+    for key in sorted(actual_keys & expected_keys):
+        actual_val = actual_meta[key]
+        expected_val = expected_meta[key]
+        if not _values_equal_for_cache_meta(actual_val, expected_val):
+            diffs.append((key, actual_val, expected_val))
+
+    if not diffs and not missing_keys and not extra_keys:
+        print("[loss-aware]   meta values match; mismatch is from missing/invalid table payload.")
+        return
+
+    for key, actual_val, expected_val in diffs[:max_diffs]:
+        print(
+            f"[loss-aware]   meta diff {key}: "
+            f"cache={_format_cache_value_for_log(actual_val)} "
+            f"current={_format_cache_value_for_log(expected_val)}"
+        )
+    if len(diffs) > max_diffs:
+        print(f"[loss-aware]   ... {len(diffs) - max_diffs} more meta diffs omitted")
+
+
 def _rank_from_ratio(m, n, ratio, max_rank=None):
     k = int(m * n * ratio / (m + n))
     k = max(1, min(k, min(m, n)))
@@ -2267,6 +2335,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                 print(f"[loss-aware] loaded layer table cache: {table_cache_path}")
             else:
                 print(f"[loss-aware] table cache meta mismatch, recomputing: {table_cache_path}")
+                _print_loss_aware_table_cache_mismatch(cache_obj, table_cache_meta, table_cache_path)
         except Exception as e:
             print(f"[loss-aware] WARNING: failed to load table cache ({e}), recomputing.")
 
