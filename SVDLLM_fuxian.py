@@ -1718,6 +1718,59 @@ def _values_equal_for_cache_meta(a, b, float_tol=1e-12):
     return a == b
 
 
+def _path_leaf_for_cache_meta(path_value):
+    if path_value is None:
+        return None
+    if not isinstance(path_value, str):
+        return path_value
+    stripped = path_value.rstrip("/\\")
+    if not stripped:
+        return stripped
+    return os.path.basename(stripped)
+
+
+def _same_model_identity_for_cache_meta(cache_value, current_value):
+    if cache_value == current_value:
+        return True
+    if not isinstance(cache_value, str) or not isinstance(current_value, str):
+        return False
+    # Local model paths are often machine-specific aliases. If both look like
+    # filesystem paths and point to the same leaf directory (e.g. llama-7b),
+    # treat them as the same model for table-cache reuse.
+    cache_is_path = os.path.isabs(cache_value) or os.path.sep in cache_value
+    current_is_path = os.path.isabs(current_value) or os.path.sep in current_value
+    if cache_is_path and current_is_path:
+        return _path_leaf_for_cache_meta(cache_value) == _path_leaf_for_cache_meta(current_value)
+    return False
+
+
+def _loss_aware_table_cache_meta_match(actual_meta, expected_meta):
+    if not isinstance(actual_meta, dict):
+        return False, []
+    actual_keys = set(actual_meta.keys())
+    expected_keys = set(expected_meta.keys())
+    if actual_keys != expected_keys:
+        return False, []
+
+    ignored = []
+    for key in sorted(expected_keys):
+        actual_val = actual_meta[key]
+        expected_val = expected_meta[key]
+        if _values_equal_for_cache_meta(actual_val, expected_val):
+            continue
+        if key == "model" and _same_model_identity_for_cache_meta(actual_val, expected_val):
+            ignored.append((key, actual_val, expected_val, "same local model leaf"))
+            continue
+        if key == "profiling_mat_path":
+            # The path itself is not a semantic cache key. The same whitening
+            # matrix is often copied or renamed across machines. Keep the real
+            # compatibility checks on dataset/candidates/seed/nsamples/etc.
+            ignored.append((key, actual_val, expected_val, "path-only difference ignored"))
+            continue
+        return False, ignored
+    return True, ignored
+
+
 def _print_loss_aware_table_cache_mismatch(cache_obj, expected_meta, cache_path, max_diffs=64):
     print(f"[loss-aware] table cache mismatch detail: {cache_path}")
     if not isinstance(cache_obj, dict):
@@ -1746,11 +1799,26 @@ def _print_loss_aware_table_cache_mismatch(cache_obj, expected_meta, cache_path,
         print(f"[loss-aware]   meta extra key: {key} actual={_format_cache_value_for_log(actual_meta[key])}")
 
     diffs = []
+    ignored_diffs = []
     for key in sorted(actual_keys & expected_keys):
         actual_val = actual_meta[key]
         expected_val = expected_meta[key]
         if not _values_equal_for_cache_meta(actual_val, expected_val):
+            if key == "model" and _same_model_identity_for_cache_meta(actual_val, expected_val):
+                ignored_diffs.append((key, actual_val, expected_val, "same local model leaf"))
+                continue
+            if key == "profiling_mat_path":
+                ignored_diffs.append((key, actual_val, expected_val, "path-only difference ignored"))
+                continue
             diffs.append((key, actual_val, expected_val))
+
+    for key, actual_val, expected_val, reason in ignored_diffs:
+        print(
+            f"[loss-aware]   meta diff ignored {key}: "
+            f"cache={_format_cache_value_for_log(actual_val)} "
+            f"current={_format_cache_value_for_log(expected_val)} "
+            f"reason={reason}"
+        )
 
     if not diffs and not missing_keys and not extra_keys:
         print("[loss-aware]   meta values match; mismatch is from missing/invalid table payload.")
@@ -2316,9 +2384,13 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
     if table_cache_path and os.path.exists(table_cache_path):
         try:
             cache_obj = torch.load(table_cache_path, map_location="cpu")
+            cache_meta_ok, cache_meta_ignored = _loss_aware_table_cache_meta_match(
+                cache_obj.get("meta") if isinstance(cache_obj, dict) else None,
+                table_cache_meta,
+            )
             if (
                 isinstance(cache_obj, dict)
-                and cache_obj.get("meta") == table_cache_meta
+                and cache_meta_ok
                 and "layer_tables" in cache_obj
                 and "layer_full_sizes" in cache_obj
             ):
@@ -2333,6 +2405,13 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                         item["delta"] = raw_delta + reg_i
                 table_cache_loaded = True
                 print(f"[loss-aware] loaded layer table cache: {table_cache_path}")
+                for key, actual_val, expected_val, reason in cache_meta_ignored:
+                    print(
+                        f"[loss-aware]   cache meta diff ignored {key}: "
+                        f"cache={_format_cache_value_for_log(actual_val)} "
+                        f"current={_format_cache_value_for_log(expected_val)} "
+                        f"reason={reason}"
+                    )
             else:
                 print(f"[loss-aware] table cache meta mismatch, recomputing: {table_cache_path}")
                 _print_loss_aware_table_cache_mismatch(cache_obj, table_cache_meta, table_cache_path)
