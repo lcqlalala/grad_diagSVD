@@ -64,29 +64,56 @@ def load_original_hf_model_fp16(
     return model, tokenizer
 
 
-def build_hflm(model, tokenizer, batch_size=1, device="cuda"):
+def build_hflm(
+    model=None,
+    tokenizer=None,
+    model_path=None,
+    tokenizer_path=None,
+    batch_size=1,
+    device="cuda",
+    trust_remote_code=False,
+):
     from lm_eval.models.huggingface import HFLM
 
-    try:
-        return HFLM(
-            pretrained=model,
-            tokenizer=tokenizer,
-            batch_size=batch_size,
-            device=device,
-        )
-    except TypeError:
-        pass
-
-    try:
-        return HFLM(
-            pretrained=model,
-            tokenizer=tokenizer,
-        )
-    except TypeError as e:
-        raise RuntimeError(
-            "Failed to initialize lm_eval.models.huggingface.HFLM. "
-            "Please check your lm-eval-harness version."
-        ) from e
+    pretrained = model_path if model_path is not None else model
+    tok = tokenizer_path if tokenizer_path is not None else tokenizer
+    attempts = [
+        {
+            "pretrained": pretrained,
+            "tokenizer": tok,
+            "batch_size": batch_size,
+            "device": device,
+            "dtype": "float16",
+            "trust_remote_code": trust_remote_code,
+        },
+        {
+            "pretrained": pretrained,
+            "tokenizer": tok,
+            "batch_size": batch_size,
+            "device": device,
+            "dtype": "float16",
+        },
+        {
+            "pretrained": pretrained,
+            "tokenizer": tok,
+            "batch_size": batch_size,
+            "device": device,
+        },
+        {
+            "pretrained": pretrained,
+            "tokenizer": tok,
+        },
+    ]
+    last_error = None
+    for kwargs in attempts:
+        try:
+            return HFLM(**kwargs)
+        except TypeError as e:
+            last_error = e
+    raise RuntimeError(
+        "Failed to initialize lm_eval.models.huggingface.HFLM. "
+        "Please check your lm-eval-harness version."
+    ) from last_error
 
 
 def extract_main_metric(task_result):
@@ -112,14 +139,20 @@ def evaluate_commonsense(
     batch_size=1,
     device="cuda",
     num_fewshot=0,
+    model_path=None,
+    tokenizer_path=None,
+    trust_remote_code=False,
 ):
     from lm_eval import evaluator
 
     hflm = build_hflm(
         model=model,
         tokenizer=tokenizer,
+        model_path=model_path,
+        tokenizer_path=tokenizer_path,
         batch_size=batch_size,
         device=device,
+        trust_remote_code=trust_remote_code,
     )
     return evaluator.simple_evaluate(
         model=hflm,
@@ -134,18 +167,29 @@ def batch_evaluate_commonsense(
     batch_size=1,
     device="cuda",
     num_fewshot=0,
+    model_path=None,
+    tokenizer_path=None,
+    trust_remote_code=False,
 ):
+    from lm_eval import evaluator
+
+    hflm = build_hflm(
+        model=model,
+        tokenizer=tokenizer,
+        model_path=model_path,
+        tokenizer_path=tokenizer_path,
+        batch_size=batch_size,
+        device=device,
+        trust_remote_code=trust_remote_code,
+    )
     results = {}
     for index, dataset in enumerate(COMMONSENSE_DATASETS, 1):
         print(f"[commonsense] {index}/{len(COMMONSENSE_DATASETS)} {dataset}")
         start_time = time.time()
         try:
-            raw_results = evaluate_commonsense(
-                model=model,
-                tokenizer=tokenizer,
-                eval_dataset_name=dataset,
-                batch_size=batch_size,
-                device=device,
+            raw_results = evaluator.simple_evaluate(
+                model=hflm,
+                tasks=[dataset],
                 num_fewshot=num_fewshot,
             )
             task_result = raw_results["results"].get(dataset, {})
@@ -179,14 +223,20 @@ def evaluate_mmlu(
     device="cuda",
     shots=0,
     task_name="mmlu",
+    model_path=None,
+    tokenizer_path=None,
+    trust_remote_code=False,
 ):
     from lm_eval import evaluator
 
     hflm = build_hflm(
         model=model,
         tokenizer=tokenizer,
+        model_path=model_path,
+        tokenizer_path=tokenizer_path,
         batch_size=batch_size,
         device=device,
+        trust_remote_code=trust_remote_code,
     )
     return evaluator.simple_evaluate(
         model=hflm,
@@ -227,14 +277,6 @@ def evaluate_original_fp16_model(
     print(f"[original-fp16] dtype=fp16 device={device}")
     print("=" * 80)
 
-    model, tokenizer = load_original_hf_model_fp16(
-        model_path=model_path,
-        tokenizer_path=tokenizer_path,
-        device=device,
-        model_seq_len=model_seq_len,
-        trust_remote_code=trust_remote_code,
-    )
-
     start_time = time.time()
     result = {
         "model_name": model_name,
@@ -247,6 +289,13 @@ def evaluate_original_fp16_model(
     }
 
     if eval_mode == "ppl":
+        model, tokenizer = load_original_hf_model_fp16(
+            model_path=model_path,
+            tokenizer_path=tokenizer_path,
+            device=device,
+            model_seq_len=model_seq_len,
+            trust_remote_code=trust_remote_code,
+        )
         ppl_eval(
             model,
             tokenizer,
@@ -264,21 +313,27 @@ def evaluate_original_fp16_model(
     elif eval_mode == "commonsense":
         if batch_commonsense:
             cs_results = batch_evaluate_commonsense(
-                model=model,
-                tokenizer=tokenizer,
+                model=None,
+                tokenizer=None,
+                model_path=model_path,
+                tokenizer_path=tokenizer_path or model_path,
                 batch_size=eval_batch_size,
                 device=device,
                 num_fewshot=commonsense_fewshot,
+                trust_remote_code=trust_remote_code,
             )
             result["commonsense_results"] = cs_results
         else:
             raw_results = evaluate_commonsense(
-                model=model,
-                tokenizer=tokenizer,
+                model=None,
+                tokenizer=None,
+                model_path=model_path,
+                tokenizer_path=tokenizer_path or model_path,
                 eval_dataset_name=commonsense_dataset,
                 batch_size=eval_batch_size,
                 device=device,
                 num_fewshot=commonsense_fewshot,
+                trust_remote_code=trust_remote_code,
             )
             task_result = raw_results["results"].get(commonsense_dataset, {})
             metric_name, metric_value = extract_main_metric(task_result)
@@ -294,12 +349,15 @@ def evaluate_original_fp16_model(
 
     elif eval_mode == "mmlu":
         raw_results = evaluate_mmlu(
-            model=model,
-            tokenizer=tokenizer,
+            model=None,
+            tokenizer=None,
+            model_path=model_path,
+            tokenizer_path=tokenizer_path or model_path,
             batch_size=eval_batch_size,
             device=device,
             shots=mmlu_shots,
             task_name=mmlu_task_name,
+            trust_remote_code=trust_remote_code,
         )
         task_result = raw_results["results"].get(mmlu_task_name, {})
         metric_name, metric_value = extract_main_metric(task_result)
