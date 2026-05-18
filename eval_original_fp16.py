@@ -34,6 +34,7 @@ def load_original_hf_model_fp16(
     device="cuda",
     model_seq_len=2048,
     trust_remote_code=False,
+    use_fast_tokenizer=False,
 ):
     """
     Load an original HuggingFace model directory in fp16.
@@ -48,7 +49,9 @@ def load_original_hf_model_fp16(
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
         trust_remote_code=trust_remote_code,
+        use_fast=use_fast_tokenizer,
     )
+    _sanitize_tokenizer(tokenizer)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
@@ -64,6 +67,32 @@ def load_original_hf_model_fp16(
     return model, tokenizer
 
 
+def _sanitize_tokenizer(tokenizer):
+    # Some LLaMA fast-tokenizer / lm-eval combinations recurse forever when
+    # unk_token_id is queried and unk_token is unset. Keep evaluation robust.
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if getattr(tokenizer, "unk_token", None) is None:
+        if getattr(tokenizer, "eos_token", None) is not None:
+            tokenizer.unk_token = tokenizer.eos_token
+        elif getattr(tokenizer, "pad_token", None) is not None:
+            tokenizer.unk_token = tokenizer.pad_token
+    return tokenizer
+
+
+def load_original_tokenizer(
+    tokenizer_path,
+    trust_remote_code=False,
+    use_fast_tokenizer=False,
+):
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=trust_remote_code,
+        use_fast=use_fast_tokenizer,
+    )
+    return _sanitize_tokenizer(tokenizer)
+
+
 def build_hflm(
     model=None,
     tokenizer=None,
@@ -76,7 +105,13 @@ def build_hflm(
     from lm_eval.models.huggingface import HFLM
 
     pretrained = model_path if model_path is not None else model
-    tok = tokenizer_path if tokenizer_path is not None else tokenizer
+    tok = tokenizer
+    if tok is None and tokenizer_path is not None:
+        tok = load_original_tokenizer(
+            tokenizer_path,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=False,
+        )
     attempts = [
         {
             "pretrained": pretrained,
@@ -260,6 +295,7 @@ def evaluate_original_fp16_model(
     mmlu_shots=0,
     mmlu_task_name="mmlu",
     trust_remote_code=False,
+    use_fast_tokenizer=False,
 ):
     """
     Evaluate one original HF-format model in fp16.
@@ -295,6 +331,7 @@ def evaluate_original_fp16_model(
             device=device,
             model_seq_len=model_seq_len,
             trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
         )
         ppl_eval(
             model,
@@ -435,6 +472,8 @@ def main():
     parser.add_argument("--mmlu_shots", type=int, default=0)
     parser.add_argument("--mmlu_task_name", type=str, default="mmlu")
     parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--use_fast_tokenizer", action="store_true",
+        help="Use fast tokenizer. Default is slow tokenizer to avoid LLaMA unk_token recursion in some lm-eval/transformers versions.")
     args = parser.parse_args()
 
     evaluate_original_fp16_llama_7b_and_llama2_7b(
@@ -452,6 +491,7 @@ def main():
         mmlu_shots=args.mmlu_shots,
         mmlu_task_name=args.mmlu_task_name,
         trust_remote_code=args.trust_remote_code,
+        use_fast_tokenizer=args.use_fast_tokenizer,
     )
 
 
