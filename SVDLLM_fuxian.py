@@ -62,6 +62,37 @@ def _set_calibration_seqlen(model, seqlen):
     return model.seqlen
 
 
+def _safe_matrix_inverse(mat, name="matrix", warn=True):
+    try:
+        return torch.linalg.inv(mat)
+    except Exception as first_error:
+        pass
+
+    eye = torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
+    diag = torch.diagonal(mat)
+    finite_diag = diag[torch.isfinite(diag)]
+    if finite_diag.numel() > 0:
+        scale = float(finite_diag.abs().mean().item())
+    else:
+        scale = 1.0
+    scale = max(scale, 1.0)
+    last_error = first_error
+    for rel_jitter in (1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
+        jitter = float(rel_jitter * scale)
+        try:
+            inv = torch.linalg.inv(mat + jitter * eye)
+            if torch.isfinite(inv).all():
+                if warn:
+                    print(f"Warning: {name} is singular; inverse succeeded with jitter={jitter:.3e}.")
+                return inv
+        except Exception as e:
+            last_error = e
+
+    if warn:
+        print(f"Warning: {name} is singular; using pseudo-inverse fallback ({last_error}).")
+    return torch.linalg.pinv(mat, rcond=1e-6)
+
+
 
 @torch.no_grad()
 def profle_svdllm(model_name, model, calib_loader, dev):
@@ -839,12 +870,10 @@ def whitening(
             dtype = W.dtype
             debug_g_info = ""
             scaling_diag_matrix = profiling_mat[i][name].to(dev)
-            try:
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: scaling_diag_matrix is not full rank!")
-                scaling_diag_matrix += 1e-6 * torch.eye(scaling_diag_matrix.shape[0]).to(dev)
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+            scaling_matrix_inv = _safe_matrix_inverse(
+                scaling_diag_matrix,
+                name=f"scaling_diag_matrix[layer={i}, module={name}]",
+            )
             scaling_diag_matrix = scaling_diag_matrix.float()
             scaling_matrix_inv = scaling_matrix_inv.float()
             W_scale = torch.matmul(W, scaling_diag_matrix)
@@ -1548,16 +1577,10 @@ class local_update:
             self.U, self.S, self.VT = torch.linalg.svd(W.data, full_matrices=False)
         else: 
             scaling_diag_matrix = scaling_diag_matrix.to(self.dev, dtype=torch.float32)
-            try:
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: scaling_diag_matrix is not full rank!")
-                scaling_diag_matrix += 1e-6 * torch.eye(
-                    scaling_diag_matrix.shape[0],
-                    device=self.dev,
-                    dtype=scaling_diag_matrix.dtype,
-                )
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+            scaling_matrix_inv = _safe_matrix_inverse(
+                scaling_diag_matrix,
+                name=f"scaling_diag_matrix[{self.name}]",
+            )
             W_scale = torch.matmul(W, scaling_diag_matrix)
             self.U, self.S, self.VT = torch.linalg.svd(W_scale, full_matrices=False)  
         # truncation SVD
@@ -2111,13 +2134,10 @@ def _low_rank_weight_from_ratio(module, ratio, dev, scaling_diag_matrix=None, ma
     scaling_inv = None
     if scaling_diag_matrix is not None:
         scaling_diag_matrix = scaling_diag_matrix.to(dev).float()
-        try:
-            scaling_inv = torch.linalg.inv(scaling_diag_matrix)
-        except Exception:
-            scaling_diag_matrix = scaling_diag_matrix + 1e-6 * torch.eye(
-                scaling_diag_matrix.shape[0], device=dev, dtype=scaling_diag_matrix.dtype
-            )
-            scaling_inv = torch.linalg.inv(scaling_diag_matrix)
+        scaling_inv = _safe_matrix_inverse(
+            scaling_diag_matrix,
+            name="scaling_diag_matrix[low_rank_weight]",
+        )
         W_scale = torch.matmul(W, scaling_diag_matrix)
     else:
         W_scale = W
@@ -2321,15 +2341,10 @@ def _loss_aware_context_greedy_repair(
             scaling_inv = None
             if profile_layer is not None and name in profile_layer:
                 scaling_diag_matrix = profile_layer[name].to(mod.weight.device).float()
-                try:
-                    scaling_inv = torch.linalg.inv(scaling_diag_matrix)
-                except Exception:
-                    scaling_diag_matrix = scaling_diag_matrix + 1e-6 * torch.eye(
-                        scaling_diag_matrix.shape[0],
-                        device=mod.weight.device,
-                        dtype=scaling_diag_matrix.dtype,
-                    )
-                    scaling_inv = torch.linalg.inv(scaling_diag_matrix)
+                scaling_inv = _safe_matrix_inverse(
+                    scaling_diag_matrix,
+                    name=f"scaling_diag_matrix[context layer={layer_id}, module={name}]",
+                )
                 W_scale = torch.matmul(W, scaling_diag_matrix)
             else:
                 W_scale = W
@@ -2699,11 +2714,10 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             W = mod.weight.data.detach().float().to(args.DEV)
             if scale is not None:
                 scale = scale.to(args.DEV).float()
-                try:
-                    scale_inv = torch.linalg.inv(scale)
-                except Exception:
-                    scale = scale + 1e-6 * torch.eye(scale.shape[0], device=args.DEV, dtype=scale.dtype)
-                    scale_inv = torch.linalg.inv(scale)
+                scale_inv = _safe_matrix_inverse(
+                    scale,
+                    name=f"scaling_diag_matrix[loss-aware layer={li}, module={name}]",
+                )
                 W_scale = torch.matmul(W, scale)
             else:
                 scale_inv = None
