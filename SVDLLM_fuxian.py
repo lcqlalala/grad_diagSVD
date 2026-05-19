@@ -62,11 +62,29 @@ def _set_calibration_seqlen(model, seqlen):
     return model.seqlen
 
 
+def _drop_redundant_mistral_attention_mask(model, batch):
+    if not _is_mistral_model("", model):
+        return batch
+    if "attention_mask" not in batch:
+        return batch
+    attention_mask = batch["attention_mask"]
+    if attention_mask.dim() != 2:
+        return batch
+    try:
+        all_visible = bool(torch.all(attention_mask == 1).item())
+    except Exception:
+        all_visible = False
+    if not all_visible:
+        return batch
+    return {k: v for k, v in batch.items() if k != "attention_mask"}
+
+
 def _safe_matrix_inverse(mat, name="matrix", warn=True):
+    last_error = None
     try:
         return torch.linalg.inv(mat)
-    except Exception as first_error:
-        pass
+    except Exception as e:
+        last_error = e
 
     eye = torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
     diag = torch.diagonal(mat)
@@ -76,7 +94,6 @@ def _safe_matrix_inverse(mat, name="matrix", warn=True):
     else:
         scale = 1.0
     scale = max(scale, 1.0)
-    last_error = first_error
     for rel_jitter in (1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
         jitter = float(rel_jitter * scale)
         try:
@@ -91,6 +108,22 @@ def _safe_matrix_inverse(mat, name="matrix", warn=True):
     if warn:
         print(f"Warning: {name} is singular; using pseudo-inverse fallback ({last_error}).")
     return torch.linalg.pinv(mat, rcond=1e-6)
+
+
+def _build_svd_mistral_modules(config, ratio, attn_ranks=None, mlp_ranks=None):
+    try:
+        svd_attn = SVD_MistralAttention(config=config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
+    except TypeError:
+        if attn_ranks:
+            print("[mistral] WARNING: SVD_MistralAttention does not support ranks=; ignoring attention rank overrides.")
+        svd_attn = SVD_MistralAttention(config=config, ratio=ratio)
+    try:
+        svd_mlp = SVD_MistralMLP(config=config, ratio=ratio, ranks=mlp_ranks if mlp_ranks else None)
+    except TypeError:
+        if mlp_ranks:
+            print("[mistral] WARNING: SVD_MistralMLP does not support ranks=; ignoring MLP rank overrides.")
+        svd_mlp = SVD_MistralMLP(config=config, ratio=ratio)
+    return svd_attn, svd_mlp
 
 
 
@@ -855,8 +888,12 @@ def whitening(
             svd_attn = svd_attn.to(dev)
             svd_mlp = svd_mlp.to(dev)
         elif is_mistral:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn, svd_mlp = _build_svd_mistral_modules(
+                model.config,
+                ratio_i,
+                attn_ranks=attn_ranks if attn_ranks else None,
+                mlp_ranks=mlp_ranks if mlp_ranks else None,
+            )
             svd_attn = svd_attn.to(dev)
             svd_mlp = svd_mlp.to(dev)
         elif is_opt:
@@ -1139,8 +1176,12 @@ def whitening_local_update(
             svd_attn = svd_attn.to(dev)
             svd_mlp = svd_mlp.to(dev)
         elif is_mistral:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio_i, ranks=attn_ranks if attn_ranks else None)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio_i, ranks=mlp_ranks if mlp_ranks else None)
+            svd_attn, svd_mlp = _build_svd_mistral_modules(
+                model.config,
+                ratio_i,
+                attn_ranks=attn_ranks if attn_ranks else None,
+                mlp_ranks=mlp_ranks if mlp_ranks else None,
+            )
             svd_attn = svd_attn.to(dev)
             svd_mlp = svd_mlp.to(dev)
         elif is_opt:
@@ -1955,10 +1996,11 @@ def _eval_calib_loss(
         else:
             batch = {k: v.to(dev_obj, non_blocking=True) for k, v in batch.items()}
         labels = batch["input_ids"]
+        model_batch = _drop_redundant_mistral_attention_mask(model, batch)
         ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if enable_autocast else nullcontext()
         with ctx:
             outputs = model(
-                **batch,
+                **model_batch,
                 labels=labels,
                 use_cache=False,
                 output_attentions=False,
