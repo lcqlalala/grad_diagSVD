@@ -54,6 +54,14 @@ def _make_position_ids(inp):
     return torch.arange(inp.shape[1], device=inp.device, dtype=torch.long).unsqueeze(0).expand(inp.shape[0], -1)
 
 
+def _make_opt_causal_attention_mask(hidden_states):
+    bsz, seqlen = hidden_states.shape[:2]
+    dtype = hidden_states.dtype if torch.is_floating_point(hidden_states) else torch.float32
+    mask = torch.full((seqlen, seqlen), torch.finfo(dtype).min, device=hidden_states.device, dtype=dtype)
+    mask = torch.triu(mask, diagonal=1)
+    return mask.view(1, 1, seqlen, seqlen).expand(bsz, 1, seqlen, seqlen)
+
+
 def _set_calibration_seqlen(model, seqlen):
     # The cached hidden-state tensors must match the actual calibration
     # sequence length, which may be smaller than config.max_position_embeddings
@@ -124,6 +132,15 @@ def _build_svd_mistral_modules(config, ratio, attn_ranks=None, mlp_ranks=None):
             print("[mistral] WARNING: SVD_MistralMLP does not support ranks=; ignoring MLP rank overrides.")
         svd_mlp = SVD_MistralMLP(config=config, ratio=ratio)
     return svd_attn, svd_mlp
+
+
+def _build_svd_opt_decoder(config, ratio, ranks_layer=None):
+    try:
+        return SVDOPTDecoderLayer(config, ratio=ratio, ranks=ranks_layer if ranks_layer else None), True
+    except TypeError:
+        if ranks_layer:
+            print("[opt] WARNING: SVDOPTDecoderLayer does not support ranks=; ignoring OPT rank overrides.")
+        return SVDOPTDecoderLayer(config, ratio=ratio), False
 
 
 
@@ -212,15 +229,18 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.cpu()
             cache['i'] += 1
+            attn = kwargs.get('attention_mask')
+            if attn is None and is_opt:
+                attn = _make_opt_causal_attention_mask(inp)
             if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask'].cpu()
+                cache['attention_mask'] = attn.cpu()
                 if not is_opt:
                     pos = kwargs.get('position_ids')
                     if pos is None:
                         pos = _make_position_ids(inp)
                     cache['position_ids'] = pos.cpu()
             else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
+                cache['attention_mask'] = torch.cat((cache['attention_mask'], attn.cpu()), dim=0)
                 if not is_opt:
                     pos = kwargs.get('position_ids')
                     if pos is None:
@@ -897,7 +917,13 @@ def whitening(
             svd_attn = svd_attn.to(dev)
             svd_mlp = svd_mlp.to(dev)
         elif is_opt:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio_i, ranks=ranks_layer if ranks_layer else None)
+            svd_decoder, opt_ranks_supported = _build_svd_opt_decoder(
+                model.config,
+                ratio_i,
+                ranks_layer=ranks_layer if ranks_layer else None,
+            )
+            if ranks_layer is not None and not opt_ranks_supported:
+                ranks_layer = None
             svd_decoder = svd_decoder.to(dev)
         else:
             raise ValueError(f"Unsupported model architecture for whitening: {model_name}")
@@ -1100,15 +1126,18 @@ def whitening_local_update(
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
+            attn = kwargs.get('attention_mask')
+            if attn is None and is_opt:
+                attn = _make_opt_causal_attention_mask(inp)
             if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask']
+                cache['attention_mask'] = attn
                 if not is_opt:
                     pos = kwargs.get('position_ids')
                     if pos is None:
                         pos = _make_position_ids(inp)
                     cache['position_ids'] = pos
             else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
+                cache['attention_mask'] = torch.cat((cache['attention_mask'], attn), dim=0)
                 if not is_opt:
                     pos = kwargs.get('position_ids')
                     if pos is None:
@@ -1185,7 +1214,13 @@ def whitening_local_update(
             svd_attn = svd_attn.to(dev)
             svd_mlp = svd_mlp.to(dev)
         elif is_opt:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio_i, ranks=ranks_layer if ranks_layer else None)
+            svd_decoder, opt_ranks_supported = _build_svd_opt_decoder(
+                model.config,
+                ratio_i,
+                ranks_layer=ranks_layer if ranks_layer else None,
+            )
+            if ranks_layer is not None and not opt_ranks_supported:
+                ranks_layer = None
             svd_decoder = svd_decoder.to(dev)
         else:
             raise ValueError(f"Unsupported model architecture for local update: {model_name}")
@@ -1554,7 +1589,10 @@ def whitening_local_update(
         global_full_params += layer_full_params
         global_low_params += layer_low_params
         global_cost_sum += layer_cost_sum
-        layer = layer.to(dev)
+        if is_opt:
+            layer = svd_decoder.to(dev)
+        else:
+            layer = layer.to(dev)
         if not is_opt:
             outs = _layer_forward_chunked(layer, inps, attention_masks, position_ids)
         else:
