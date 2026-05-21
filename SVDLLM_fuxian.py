@@ -118,10 +118,23 @@ def _safe_matrix_inverse(mat, name="matrix", warn=True):
     return torch.linalg.pinv(mat, rcond=1e-6)
 
 
-def _safe_cholesky(mat, name="matrix", warn=True):
+def _resolve_profiling_cholesky_dtype(dtype_name):
+    dtype_name = str(dtype_name).lower()
+    if dtype_name in ("fp32", "float32"):
+        return torch.float32
+    if dtype_name in ("fp64", "float64", "double"):
+        return torch.float64
+    raise ValueError(f"Unsupported profiling_cholesky_dtype={dtype_name}")
+
+
+def _safe_cholesky(mat, name="matrix", warn=True, timing=False):
+    start_time = time.time() if timing else None
     chol, info = torch.linalg.cholesky_ex(mat)
     if int(info.max().item()) == 0:
+        if timing:
+            print(f"[profile-cholesky-done] {name} time={time.time() - start_time:.2f}s jitter=0.000e+00")
         return chol
+    del chol
 
     diag = torch.diagonal(mat)
     finite_diag = diag[torch.isfinite(diag)]
@@ -130,16 +143,21 @@ def _safe_cholesky(mat, name="matrix", warn=True):
     else:
         scale = 1.0
     scale = max(scale, 1.0)
-    eye = torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
     last_info = int(info.max().item())
     for rel_jitter in (1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
         jitter = float(rel_jitter * scale)
-        chol, info = torch.linalg.cholesky_ex(mat + jitter * eye)
+        work = mat.clone()
+        torch.diagonal(work).add_(jitter)
+        chol, info = torch.linalg.cholesky_ex(work)
+        del work
         last_info = int(info.max().item())
         if last_info == 0:
             if warn:
                 print(f"Warning: {name} is not positive definite; cholesky succeeded with jitter={jitter:.3e}.")
+            if timing:
+                print(f"[profile-cholesky-done] {name} time={time.time() - start_time:.2f}s jitter={jitter:.3e}")
             return chol
+        del chol
 
     jitter = float(1e-1 * scale)
     if warn:
@@ -147,7 +165,13 @@ def _safe_cholesky(mat, name="matrix", warn=True):
             f"Warning: {name} cholesky still failed (info={last_info}); "
             f"using conservative jitter={jitter:.3e}."
         )
-    return torch.linalg.cholesky(mat + jitter * eye)
+    work = mat.clone()
+    torch.diagonal(work).add_(jitter)
+    chol = torch.linalg.cholesky(work)
+    del work
+    if timing:
+        print(f"[profile-cholesky-done] {name} time={time.time() - start_time:.2f}s jitter={jitter:.3e}")
+    return chol
 
 
 def _validate_profiling_mat_shapes(model_name, model, profiling_mat):
@@ -211,7 +235,7 @@ def _build_svd_opt_decoder(config, ratio, ranks_layer=None):
 
 
 @torch.no_grad()
-def profle_svdllm(model_name, model, calib_loader, dev):
+def profle_svdllm(model_name, model, calib_loader, dev, profiling_cholesky_dtype="fp64", profile_cholesky_timing=False):
     if _is_llama_family_model(model_name, model):
         layers = model.model.layers
     elif _is_opt_model(model_name, model):
@@ -247,15 +271,17 @@ def profle_svdllm(model_name, model, calib_loader, dev):
             subset[name].raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.cpu()
     profiling_mat = {}
     print("Start Cholesky Decomposition...")
+    chol_dtype = _resolve_profiling_cholesky_dtype(profiling_cholesky_dtype)
     for i in tqdm(range(len(layers))):
         layer_profile = {}
         subset = find_layers(layers[i])
         for name in subset:
-            raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.double().to(dev)
-            print(f"[profile-cholesky] layer {i:02d} {name} shape={tuple(raw_scaling_diag_matrix.shape)}")
+            raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.to(device=dev, dtype=chol_dtype)
+            print(f"[profile-cholesky] layer {i:02d} {name} shape={tuple(raw_scaling_diag_matrix.shape)} dtype={raw_scaling_diag_matrix.dtype}")
             scaling_diag_matrix = _safe_cholesky(
                 raw_scaling_diag_matrix,
                 name=f"scaling_diag_matrix[layer={i}, module={name}]",
+                timing=profile_cholesky_timing,
             )
             layer_profile[name] = scaling_diag_matrix.cpu()
             scaling_diag_matrix = raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix = None
@@ -266,7 +292,7 @@ def profle_svdllm(model_name, model, calib_loader, dev):
         
 
 @torch.no_grad()
-def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
+def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profiling_cholesky_dtype="fp64", profile_cholesky_timing=False):
     is_opt = _is_opt_model(model_name, model)
     if is_opt:
         layers = model.model.decoder.layers
@@ -331,6 +357,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
     if not is_opt:
         position_ids = cache['position_ids']
     profiling_mat = {}
+    chol_dtype = _resolve_profiling_cholesky_dtype(profiling_cholesky_dtype)
     for i in tqdm(range(len(layers))):
         layer_profile = {}
         layer = layers[i].to(dev)
@@ -360,11 +387,12 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
             subset[name].scaling_diag_matrix = subset[name].scaling_diag_matrix.cpu()
         torch.cuda.empty_cache()
         for name in subset:
-            raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.double().to(dev)
-            print(f"[profile-cholesky] layer {i:02d} {name} shape={tuple(raw_scaling_diag_matrix.shape)}")
+            raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.to(device=dev, dtype=chol_dtype)
+            print(f"[profile-cholesky] layer {i:02d} {name} shape={tuple(raw_scaling_diag_matrix.shape)} dtype={raw_scaling_diag_matrix.dtype}")
             scaling_diag_matrix = _safe_cholesky(
                 raw_scaling_diag_matrix,
                 name=f"scaling_diag_matrix[layer={i}, module={name}]",
+                timing=profile_cholesky_timing,
             )
             layer_profile[name] = scaling_diag_matrix.cpu()
             scaling_diag_matrix = raw_scaling_diag_matrix = None
@@ -3805,6 +3833,10 @@ if __name__ == '__main__':
     parser.add_argument('--updating_nsamples', type=int, default=16, help='Number of calibration data samples for udpating.')
     parser.add_argument('--save_path', type=str, default=None, help='the path to save the compressed model checkpoints.`')
     parser.add_argument('--profiling_mat_path', type=str, default=None, help='Local path to load the profiling matrices`')
+    parser.add_argument('--profiling_cholesky_dtype', type=str, default='fp64', choices=['fp64', 'fp32'],
+        help='Dtype used for whitening Cholesky profiling. fp64 preserves the original behavior; fp32 reduces VRAM and is recommended for LLaMA-13B.')
+    parser.add_argument('--profile_cholesky_timing', action='store_true',
+        help='Print elapsed time after each whitening Cholesky factorization.')
     parser.add_argument('--use_layerwise_ratio', action='store_true', help='allocate per-layer ratios based on G importance')
     parser.add_argument('--layer_ratio_min', type=float, default=0.01, help='Minimum per-layer keep ratio')
     parser.add_argument('--layer_ratio_max', type=float, default=0.99, help='Maximum per-layer keep ratio')
@@ -3952,7 +3984,14 @@ if __name__ == '__main__':
         cali_white_data = None
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len, seed=args.seed)
-            profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
+            profiling_mat = profle_svdllm_low_resource(
+                args.model,
+                model,
+                cali_white_data,
+                args.DEV,
+                profiling_cholesky_dtype=args.profiling_cholesky_dtype,
+                profile_cholesky_timing=args.profile_cholesky_timing,
+            )
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
@@ -4008,7 +4047,14 @@ if __name__ == '__main__':
         cali_white_data = None
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len, seed=args.seed)
-            profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
+            profiling_mat = profle_svdllm_low_resource(
+                args.model,
+                model,
+                cali_white_data,
+                args.DEV,
+                profiling_cholesky_dtype=args.profiling_cholesky_dtype,
+                profile_cholesky_timing=args.profile_cholesky_timing,
+            )
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
