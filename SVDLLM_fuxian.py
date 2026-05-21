@@ -118,6 +118,72 @@ def _safe_matrix_inverse(mat, name="matrix", warn=True):
     return torch.linalg.pinv(mat, rcond=1e-6)
 
 
+def _safe_cholesky(mat, name="matrix", warn=True):
+    chol, info = torch.linalg.cholesky_ex(mat)
+    if int(info.max().item()) == 0:
+        return chol
+
+    diag = torch.diagonal(mat)
+    finite_diag = diag[torch.isfinite(diag)]
+    if finite_diag.numel() > 0:
+        scale = float(finite_diag.abs().mean().item())
+    else:
+        scale = 1.0
+    scale = max(scale, 1.0)
+    eye = torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
+    last_info = int(info.max().item())
+    for rel_jitter in (1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
+        jitter = float(rel_jitter * scale)
+        chol, info = torch.linalg.cholesky_ex(mat + jitter * eye)
+        last_info = int(info.max().item())
+        if last_info == 0:
+            if warn:
+                print(f"Warning: {name} is not positive definite; cholesky succeeded with jitter={jitter:.3e}.")
+            return chol
+
+    jitter = float(1e-1 * scale)
+    if warn:
+        print(
+            f"Warning: {name} cholesky still failed (info={last_info}); "
+            f"using conservative jitter={jitter:.3e}."
+        )
+    return torch.linalg.cholesky(mat + jitter * eye)
+
+
+def _validate_profiling_mat_shapes(model_name, model, profiling_mat):
+    if profiling_mat is None:
+        return
+    layers = _get_transformer_layers(model_name, model)
+    if layers is None:
+        return
+    if len(profiling_mat) != len(layers):
+        raise ValueError(
+            f"profiling_mat layer count mismatch: "
+            f"got {len(profiling_mat)}, expected {len(layers)} for {model_name}. "
+            "Please regenerate profiling matrices for the current model."
+        )
+    for i, layer in enumerate(layers):
+        if i not in profiling_mat:
+            raise ValueError(f"profiling_mat missing layer {i}; please regenerate it for {model_name}.")
+        layer_profile = profiling_mat[i]
+        subset = find_layers(layer)
+        for name, module in subset.items():
+            if name not in layer_profile:
+                raise ValueError(
+                    f"profiling_mat missing layer {i} module {name}; "
+                    f"please regenerate it for {model_name}."
+                )
+            mat = layer_profile[name]
+            expected = (int(module.weight.shape[1]), int(module.weight.shape[1]))
+            actual = tuple(mat.shape)
+            if actual != expected:
+                raise ValueError(
+                    f"profiling_mat shape mismatch at layer {i} module {name}: "
+                    f"got {actual}, expected {expected} for weight shape {tuple(module.weight.shape)}. "
+                    "This usually means a profiling matrix from another model size was loaded."
+                )
+
+
 def _build_svd_mistral_modules(config, ratio, attn_ranks=None, mlp_ranks=None):
     try:
         svd_attn = SVD_MistralAttention(config=config, ratio=ratio, ranks=attn_ranks if attn_ranks else None)
@@ -186,15 +252,11 @@ def profle_svdllm(model_name, model, calib_loader, dev):
         subset = find_layers(layers[i])
         for name in subset:
             raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.double().to(dev)
-            try:
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: eigen scaling_diag_matrix is not positive!")
-                eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
-                raw_scaling_diag_matrix += (- eigenvalues[0] + 1e-6) * torch.eye(raw_scaling_diag_matrix.shape[0]).to(dev)
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-                eigenvalues = None
-                del eigenvalues
+            print(f"[profile-cholesky] layer {i:02d} {name} shape={tuple(raw_scaling_diag_matrix.shape)}")
+            scaling_diag_matrix = _safe_cholesky(
+                raw_scaling_diag_matrix,
+                name=f"scaling_diag_matrix[layer={i}, module={name}]",
+            )
             layer_profile[name] = scaling_diag_matrix.cpu()
             scaling_diag_matrix = raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix = None
             del scaling_diag_matrix, raw_scaling_diag_matrix, subset[name].raw_scaling_diag_matrix
@@ -299,15 +361,11 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         torch.cuda.empty_cache()
         for name in subset:
             raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.double().to(dev)
-            try:
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: eigen scaling_diag_matrix is not positive!")
-                eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
-                raw_scaling_diag_matrix += (- eigenvalues[0] + 1e-6) * torch.eye(raw_scaling_diag_matrix.shape[0]).to(dev)
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-                eigenvalues = None
-                del eigenvalues
+            print(f"[profile-cholesky] layer {i:02d} {name} shape={tuple(raw_scaling_diag_matrix.shape)}")
+            scaling_diag_matrix = _safe_cholesky(
+                raw_scaling_diag_matrix,
+                name=f"scaling_diag_matrix[layer={i}, module={name}]",
+            )
             layer_profile[name] = scaling_diag_matrix.cpu()
             scaling_diag_matrix = raw_scaling_diag_matrix = None
             del scaling_diag_matrix, raw_scaling_diag_matrix
@@ -3899,6 +3957,7 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
+            _validate_profiling_mat_shapes(args.model, model, profiling_mat)
         if args.use_loss_aware_layerwise:
             if args.use_module_rank_allocation:
                 print("[loss-aware] --use_loss_aware_layerwise takes priority; --use_module_rank_allocation is ignored.")
@@ -3954,6 +4013,7 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
+            _validate_profiling_mat_shapes(args.model, model, profiling_mat)
         if args.use_loss_aware_layerwise:
             if args.use_module_rank_allocation:
                 print("[loss-aware] --use_loss_aware_layerwise takes priority; --use_module_rank_allocation is ignored.")
