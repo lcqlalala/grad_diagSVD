@@ -1818,8 +1818,19 @@ class local_update:
         return weights
 
     def add_batch_update_u(self, inp, out):
-        inps = inp.view(inp.shape[0] * inp.shape[1], inp.shape[2]).float()
-        outs = out.view(out.shape[0] * out.shape[1], out.shape[2]).float()
+        if inp.dim() == 3:
+            inps = inp.reshape(inp.shape[0] * inp.shape[1], inp.shape[2]).float()
+        elif inp.dim() == 2:
+            inps = inp.reshape(inp.shape[0], inp.shape[1]).float()
+        else:
+            inps = inp.reshape(-1, inp.shape[-1]).float()
+
+        if out.dim() == 3:
+            outs = out.reshape(out.shape[0] * out.shape[1], out.shape[2]).float()
+        elif out.dim() == 2:
+            outs = out.reshape(out.shape[0], out.shape[1]).float()
+        else:
+            outs = out.reshape(-1, out.shape[-1]).float()
         # Rank-space feature used by both U-step and V-step.
         x_latent = torch.matmul(torch.matmul(inps, self.truc_v.t()), self.truc_sigma)  # [N, r]
         base_output = torch.matmul(x_latent, self.truc_u.t())  # [N, d_out]
