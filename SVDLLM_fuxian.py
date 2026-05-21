@@ -1923,6 +1923,12 @@ class local_update:
             outs = out.reshape(out.shape[0], out.shape[1]).float()
         else:
             outs = out.reshape(-1, out.shape[-1]).float()
+        if inps.shape[1] != self.columns or outs.shape[1] != self.rows:
+            raise ValueError(
+                f"local_update shape mismatch for {self.name}: "
+                f"input={tuple(inp.shape)} -> {tuple(inps.shape)} expected last dim {self.columns}; "
+                f"output={tuple(out.shape)} -> {tuple(outs.shape)} expected last dim {self.rows}."
+            )
         # Rank-space feature used by both U-step and V-step.
         x_latent = torch.matmul(torch.matmul(inps, self.truc_v.t()), self.truc_sigma)  # [N, r]
         base_output = torch.matmul(x_latent, self.truc_u.t())  # [N, d_out]
