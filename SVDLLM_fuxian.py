@@ -1345,7 +1345,13 @@ def whitening_local_update(
         
         def add_batch(name):
             def tmp(_, inp, out):
-                gpts[name].add_batch_update_u(inp[0].data, out.data)
+                inp_data = inp[0].data
+                out_data = out.data
+                if inp_data.dim() == 2:
+                    inp_data = inp_data.unsqueeze(0)
+                if out_data.dim() == 2:
+                    out_data = out_data.unsqueeze(0)
+                gpts[name].add_batch_update_u(inp_data, out_data)
             return tmp
 
         def _assign_svd_factor(name, svd_u, svd_v):
