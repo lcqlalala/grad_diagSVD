@@ -560,11 +560,11 @@ def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_
             return base
         if "o_proj" in name or "out_proj" in name:
             return min_rank_overrides.get("o_proj", base)
-        if "down_proj" in name:
+        if "down_proj" in name or "fc2" in name:
             return min_rank_overrides.get("down_proj", base)
         if "q_proj" in name or "k_proj" in name or "v_proj" in name:
             return min_rank_overrides.get("qkv", min_rank_overrides.get("attn", base))
-        if "gate_proj" in name or "up_proj" in name:
+        if "gate_proj" in name or "up_proj" in name or "fc1" in name:
             return min_rank_overrides.get("mlp", base)
         return base
     for layer_id in spectra:
@@ -635,8 +635,8 @@ def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_
         def _mtype_alloc(nm):
             if any(t in nm for t in ("q_proj", "k_proj", "v_proj")): return "qkv"
             if any(t in nm for t in ("o_proj", "out_proj")):          return "o"
-            if "down_proj" in nm:                                      return "down"
-            if any(t in nm for t in ("gate_proj", "up_proj")):        return "mlp"
+            if any(t in nm for t in ("down_proj", "fc2")):            return "down"
+            if any(t in nm for t in ("gate_proj", "up_proj", "fc1")): return "mlp"
             return "other"
         type_floor = {}   # mtype → (floor_rank, uniform_rank, cost, count)
         for entry in entries:
@@ -907,9 +907,9 @@ def _module_rank_type(name):
         return "qkv"
     if any(t in name for t in ("o_proj", "out_proj")):
         return "o"
-    if "down_proj" in name:
+    if "down_proj" in name or "fc2" in name:
         return "down"
-    if any(t in name for t in ("gate_proj", "up_proj")):
+    if any(t in name for t in ("gate_proj", "up_proj", "fc1")):
         return "mlp"
     return "other"
 
@@ -1308,6 +1308,7 @@ def whitening_local_update(
             if ranks_layer is not None and not opt_ranks_supported:
                 ranks_layer = None
             svd_decoder = svd_decoder.to(dev)
+            svd_decoder.eval()
         else:
             raise ValueError(f"Unsupported model architecture for local update: {model_name}")
         for name in subset:
@@ -1437,10 +1438,6 @@ def whitening_local_update(
         def _propagation_aware_refine():
             if not propagation_aware_update:
                 return
-            if is_opt:
-                if debug_svd:
-                    print(f"[prop-aware] layer {i:02d}: skip OPT path for now.")
-                return
             target_names = []
             for cand_name in gpts:
                 kind = _propagation_target_kind(cand_name)
@@ -1461,8 +1458,15 @@ def whitening_local_update(
                         v_mod.weight.data.detach().clone(),
                     )
 
-            original_self_attn = layer.self_attn
-            original_mlp = layer.mlp
+            if is_opt:
+                svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
+                svd_decoder.final_layer_norm = layer.final_layer_norm
+                svd_decoder.eval()
+                original_self_attn = None
+                original_mlp = None
+            else:
+                original_self_attn = layer.self_attn
+                original_mlp = layer.mlp
             max_batches = inps.shape[0]
             if propagation_aware_max_batches > 0:
                 max_batches = min(max_batches, propagation_aware_max_batches)
@@ -1481,22 +1485,35 @@ def whitening_local_update(
                 if any(_propagation_target_kind(n) == "o" for n in target_names):
                     def save_full_o(_, inp, out):
                         full_targets["o"] = out.detach()
-                    full_handles.append(original_self_attn.o_proj.register_forward_hook(save_full_o))
+                    if is_opt:
+                        full_handles.append(layer.self_attn.out_proj.register_forward_hook(save_full_o))
+                    else:
+                        full_handles.append(original_self_attn.o_proj.register_forward_hook(save_full_o))
                 if any(_propagation_target_kind(n) == "down" for n in target_names):
                     def save_full_down(_, inp, out):
                         full_targets["down"] = out.detach()
-                    full_handles.append(original_mlp.down_proj.register_forward_hook(save_full_down))
+                    if is_opt:
+                        full_handles.append(layer.fc2.register_forward_hook(save_full_down))
+                    else:
+                        full_handles.append(original_mlp.down_proj.register_forward_hook(save_full_down))
 
-                full_out = layer(
-                    hs_chunk,
-                    attention_mask=attn_chunk,
-                    position_ids=pos_chunk,
-                )[0].detach()
+                if is_opt:
+                    full_out = layer(
+                        hs_chunk,
+                        attention_mask=attn_chunk,
+                    )[0].detach()
+                else:
+                    full_out = layer(
+                        hs_chunk,
+                        attention_mask=attn_chunk,
+                        position_ids=pos_chunk,
+                    )[0].detach()
                 for h in full_handles:
                     h.remove()
 
-                layer.self_attn = svd_attn
-                layer.mlp = svd_mlp
+                if not is_opt:
+                    layer.self_attn = svd_attn
+                    layer.mlp = svd_mlp
                 comp_handles = []
 
                 for cand_name in target_names:
@@ -1515,27 +1532,38 @@ def whitening_local_update(
 
                     comp_handles.append(v_mod.register_forward_hook(make_capture(cand_name, kind, u_mod)))
 
-                comp_out = layer(
-                    hs_chunk,
-                    attention_mask=attn_chunk,
-                    position_ids=pos_chunk,
-                )[0].detach()
+                if is_opt:
+                    comp_out = svd_decoder(
+                        hs_chunk,
+                        attention_mask=attn_chunk,
+                    )[0].detach()
+                else:
+                    comp_out = layer(
+                        hs_chunk,
+                        attention_mask=attn_chunk,
+                        position_ids=pos_chunk,
+                    )[0].detach()
                 for h in comp_handles:
                     h.remove()
-                layer.self_attn = original_self_attn
-                layer.mlp = original_mlp
+                if not is_opt:
+                    layer.self_attn = original_self_attn
+                    layer.mlp = original_mlp
 
                 base_sse += float(torch.sum((comp_out.float() - full_out.float()) ** 2).item())
                 base_count += int(full_out.numel())
 
             if base_count <= 0:
-                layer.self_attn = original_self_attn
-                layer.mlp = original_mlp
+                if not is_opt:
+                    layer.self_attn = original_self_attn
+                    layer.mlp = original_mlp
                 return
 
             _solve_and_assign(target_names)
-            layer.self_attn = svd_attn
-            layer.mlp = svd_mlp
+            if not is_opt:
+                layer.self_attn = svd_attn
+                layer.mlp = svd_mlp
+            else:
+                svd_decoder.eval()
 
             new_sse = 0.0
             new_count = 0
@@ -1544,20 +1572,30 @@ def whitening_local_update(
                 hs_chunk = inps[st:ed]
                 attn_chunk = attention_masks[st:ed]
                 pos_chunk = position_ids[st:ed] if not is_opt else None
-                layer.self_attn = original_self_attn
-                layer.mlp = original_mlp
-                full_out = layer(
-                    hs_chunk,
-                    attention_mask=attn_chunk,
-                    position_ids=pos_chunk,
-                )[0].detach()
-                layer.self_attn = svd_attn
-                layer.mlp = svd_mlp
-                comp_out = layer(
-                    hs_chunk,
-                    attention_mask=attn_chunk,
-                    position_ids=pos_chunk,
-                )[0].detach()
+                if is_opt:
+                    full_out = layer(
+                        hs_chunk,
+                        attention_mask=attn_chunk,
+                    )[0].detach()
+                    comp_out = svd_decoder(
+                        hs_chunk,
+                        attention_mask=attn_chunk,
+                    )[0].detach()
+                else:
+                    layer.self_attn = original_self_attn
+                    layer.mlp = original_mlp
+                    full_out = layer(
+                        hs_chunk,
+                        attention_mask=attn_chunk,
+                        position_ids=pos_chunk,
+                    )[0].detach()
+                    layer.self_attn = svd_attn
+                    layer.mlp = svd_mlp
+                    comp_out = layer(
+                        hs_chunk,
+                        attention_mask=attn_chunk,
+                        position_ids=pos_chunk,
+                    )[0].detach()
                 new_sse += float(torch.sum((comp_out.float() - full_out.float()) ** 2).item())
                 new_count += int(full_out.numel())
 
@@ -1579,8 +1617,9 @@ def whitening_local_update(
                         u_mod.weight.data.copy_(u_w)
                         v_mod.weight.data.copy_(v_w)
 
-            layer.self_attn = original_self_attn
-            layer.mlp = original_mlp
+            if not is_opt:
+                layer.self_attn = original_self_attn
+                layer.mlp = original_mlp
 
         def _run_layer_chunks_no_output(layer_mod, hs, attn, pos_ids=None):
             n = hs.shape[0]
@@ -2947,11 +2986,11 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                 return base
             if "o_proj" in name or "out_proj" in name:
                 return min_rank_overrides.get("o_proj", base)
-            if "down_proj" in name:
+            if "down_proj" in name or "fc2" in name:
                 return min_rank_overrides.get("down_proj", base)
             if _is_qkv_name(name):
                 return min_rank_overrides.get("qkv", min_rank_overrides.get("attn", base))
-            if "gate_proj" in name or "up_proj" in name:
+            if "gate_proj" in name or "up_proj" in name or "fc1" in name:
                 return min_rank_overrides.get("mlp", base)
             return base
 
@@ -3402,11 +3441,11 @@ def allocate_module_ranks_within_layer_budget(
             return base
         if "o_proj" in name or "out_proj" in name:
             return min_rank_overrides.get("o_proj", base)
-        if "down_proj" in name:
+        if "down_proj" in name or "fc2" in name:
             return min_rank_overrides.get("down_proj", base)
         if "q_proj" in name or "k_proj" in name or "v_proj" in name:
             return min_rank_overrides.get("qkv", min_rank_overrides.get("attn", base))
-        if "gate_proj" in name or "up_proj" in name:
+        if "gate_proj" in name or "up_proj" in name or "fc1" in name:
             return min_rank_overrides.get("mlp", base)
         return base
 
@@ -3718,9 +3757,9 @@ def _obtain_module_ranks(args, model, profiling_mat):
                 return "qkv"
             if any(t in nm for t in ("o_proj", "out_proj")):
                 return "o"
-            if "down_proj" in nm:
+            if "down_proj" in nm or "fc2" in nm:
                 return "down"
-            if any(t in nm for t in ("gate_proj", "up_proj")):
+            if any(t in nm for t in ("gate_proj", "up_proj", "fc1")):
                 return "mlp"
             return "other"
         mtype_ranks = {}
