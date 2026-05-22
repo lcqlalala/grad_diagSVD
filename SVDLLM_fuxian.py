@@ -1186,7 +1186,10 @@ def whitening_local_update(
           f"(bi_closed_form={use_bi_closed_form}, weighted={use_weighted_update}, "
           f"weight_mode={bi_weight_mode}, layer_batch_size={update_layer_batch_size}, "
           f"mode={local_update_mode}, min_rel_gain={float(local_update_min_rel_gain):.4g}, "
-          f"propagation_aware={propagation_aware_update})...")
+          f"propagation_aware={propagation_aware_update}, "
+          f"propagation_targets={','.join(sorted(propagation_aware_target_set))}, "
+          f"propagation_alpha={propagation_aware_alpha:g}, "
+          f"propagation_max_batches={propagation_aware_max_batches})...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
     if is_opt:
@@ -3995,7 +3998,7 @@ if __name__ == '__main__':
     parser.add_argument('--propagation_aware_update', action='store_true',
         help='Enable propagation-aware residual-distillation local update for selected downstream projections, gated by full layer output MSE.')
     parser.add_argument('--propagation_aware_targets', type=str, default='o,down',
-        help='Comma-separated propagation-aware target module groups: o,down. Default updates o_proj and down_proj candidates.')
+        help='Comma-separated propagation-aware target groups: o,down. For LLaMA/Mistral this maps to o_proj/down_proj; for OPT this maps to out_proj/fc2.')
     parser.add_argument('--propagation_aware_alpha', type=float, default=1.0,
         help='Blend strength for propagation-aware targets: target = compressed_output + alpha * (full_output - compressed_output).')
     parser.add_argument('--propagation_aware_gate_margin', type=float, default=0.0,
