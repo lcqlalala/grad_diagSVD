@@ -94,6 +94,7 @@ def _safe_matrix_inverse(mat, name="matrix", warn=True):
     except Exception as e:
         last_error = e
 
+    mat = torch.nan_to_num(mat, nan=0.0, posinf=1e6, neginf=-1e6)
     eye = torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
     diag = torch.diagonal(mat)
     finite_diag = diag[torch.isfinite(diag)]
@@ -101,8 +102,8 @@ def _safe_matrix_inverse(mat, name="matrix", warn=True):
         scale = float(finite_diag.abs().mean().item())
     else:
         scale = 1.0
-    scale = max(scale, 1.0)
-    for rel_jitter in (1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
+    scale = max(scale, 1e-8)
+    for rel_jitter in (1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0):
         jitter = float(rel_jitter * scale)
         try:
             inv = torch.linalg.inv(mat + jitter * eye)
@@ -115,7 +116,24 @@ def _safe_matrix_inverse(mat, name="matrix", warn=True):
 
     if warn:
         print(f"Warning: {name} is singular; using pseudo-inverse fallback ({last_error}).")
-    return torch.linalg.pinv(mat, rcond=1e-6)
+    try:
+        inv = torch.linalg.pinv(mat, rcond=1e-6)
+        if torch.isfinite(inv).all():
+            return inv
+    except Exception as e:
+        last_error = e
+
+    if warn:
+        print(f"Warning: {name} pseudo-inverse failed ({last_error}); using diagonal inverse fallback.")
+    diag = torch.diagonal(mat)
+    diag_abs = diag.abs()
+    safe_diag = torch.where(diag_abs > scale * 1e-6, diag, torch.ones_like(diag))
+    diag_inv = torch.where(
+        diag_abs > scale * 1e-6,
+        1.0 / safe_diag,
+        torch.zeros_like(diag),
+    )
+    return torch.diag(diag_inv)
 
 
 def _resolve_profiling_cholesky_dtype(dtype_name):
@@ -1870,29 +1888,46 @@ class local_update:
         return self._solve_ridge_from_stats(lhs, rhs, ridge=0.0, prior=None)
 
     def _solve_ridge_from_stats(self, lhs, rhs, ridge=0.0, prior=None):
-        lhs2 = lhs
-        rhs2 = rhs
+        lhs2 = torch.nan_to_num(lhs, nan=0.0, posinf=1e6, neginf=-1e6)
+        rhs2 = torch.nan_to_num(rhs, nan=0.0, posinf=1e6, neginf=-1e6)
+        lhs2 = 0.5 * (lhs2 + lhs2.t())
         if ridge > 0:
             # Scale ridge by matrix magnitude so the same CLI value is meaningful
             # across layers/ranks with very different activation energy.
-            lhs_scale = torch.trace(lhs2).abs() / max(1, int(lhs2.shape[0]))
+            diag = torch.diagonal(lhs2)
+            finite_diag = diag[torch.isfinite(diag)]
+            lhs_scale = finite_diag.abs().mean() if finite_diag.numel() > 0 else torch.tensor(1.0, device=lhs2.device, dtype=lhs2.dtype)
             ridge_eff = float(ridge) * float(max(float(lhs_scale.item()), 1e-8))
             eye = torch.eye(lhs2.shape[0], device=lhs2.device, dtype=lhs2.dtype)
             lhs2 = lhs2 + ridge_eff * eye
             if prior is not None:
-                rhs2 = rhs2 + ridge_eff * prior
+                rhs2 = rhs2 + ridge_eff * torch.nan_to_num(prior, nan=0.0, posinf=1e6, neginf=-1e6)
         # Robust solver path: avoid expensive lstsq fallback on ill-conditioned
-        # matrices; try Cholesky with jitter first, then solve, then pinv.
+        # matrices; try Cholesky with scale-aware jitter first, then solve, then
+        # CPU double solve. Do not rely on pinv as the final path because SVD can
+        # fail to converge for repeated/ill-conditioned spectra.
         eye = torch.eye(lhs2.shape[0], device=lhs2.device, dtype=lhs2.dtype)
-        for jitter in (0.0, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3):
+        diag = torch.diagonal(lhs2)
+        finite_diag = diag[torch.isfinite(diag)]
+        if finite_diag.numel() > 0:
+            mat_scale = float(finite_diag.abs().mean().item())
+        else:
+            mat_scale = float(lhs2[torch.isfinite(lhs2)].abs().mean().item()) if torch.isfinite(lhs2).any() else 1.0
+        mat_scale = max(mat_scale, 1e-8)
+        jitter_schedule = (0.0, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0)
+        for rel_jitter in jitter_schedule:
+            jitter = float(rel_jitter * mat_scale)
             mat = lhs2 if jitter == 0.0 else (lhs2 + jitter * eye)
             try:
                 chol, info = torch.linalg.cholesky_ex(mat)
                 if int(info.max().item()) == 0:
-                    return torch.cholesky_solve(rhs2, chol)
+                    sol = torch.cholesky_solve(rhs2, chol)
+                    if torch.isfinite(sol).all():
+                        return sol
             except Exception:
                 pass
-        for jitter in (0.0, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3):
+        for rel_jitter in jitter_schedule:
+            jitter = float(rel_jitter * mat_scale)
             mat = lhs2 if jitter == 0.0 else (lhs2 + jitter * eye)
             try:
                 sol = torch.linalg.solve(mat, rhs2)
@@ -1900,9 +1935,31 @@ class local_update:
                     return sol
             except Exception:
                 pass
+        try:
+            lhs_cpu = lhs2.detach().to(device="cpu", dtype=torch.float64)
+            rhs_cpu = rhs2.detach().to(device="cpu", dtype=torch.float64)
+            eye_cpu = torch.eye(lhs_cpu.shape[0], device=lhs_cpu.device, dtype=lhs_cpu.dtype)
+            for rel_jitter in (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0):
+                jitter = float(rel_jitter * mat_scale)
+                mat_cpu = lhs_cpu + jitter * eye_cpu
+                try:
+                    sol_cpu = torch.linalg.solve(mat_cpu, rhs_cpu)
+                    if torch.isfinite(sol_cpu).all():
+                        if self.debug_svd:
+                            print(f"[debug] {self.name} solver fallback: cpu_solve jitter={jitter:.3e}")
+                        return sol_cpu.to(device=rhs2.device, dtype=rhs2.dtype)
+                except Exception:
+                    pass
+        except Exception as e:
+            if self.debug_svd:
+                print(f"[debug] {self.name} cpu_solve fallback failed: {e}")
+        if prior is not None:
+            if self.debug_svd:
+                print(f"[debug] {self.name} solver fallback: prior")
+            return torch.nan_to_num(prior, nan=0.0, posinf=1e6, neginf=-1e6).to(device=rhs2.device, dtype=rhs2.dtype)
         if self.debug_svd:
-            print(f"[debug] {self.name} solver fallback: pinv")
-        return torch.linalg.pinv(lhs2 + 1e-4 * eye).matmul(rhs2)
+            print(f"[debug] {self.name} solver fallback: zeros")
+        return torch.zeros_like(rhs2)
 
     def _objective_from_stats(self, A, xx=None, xy=None, out_sq=None):
         # SSE(A) = ||XA - Y||_F^2 = tr(A^T XX A) - 2 tr(A^T XY) + tr(Y^T Y)
@@ -2420,6 +2477,64 @@ def _loss_aware_candidate_ratios(args):
     return sorted({round(v, 8) for v in vals})
 
 
+def _loss_aware_finite_float(value):
+    try:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().item()
+        value = float(value)
+        return value, math.isfinite(value)
+    except Exception:
+        return float("nan"), False
+
+
+def _loss_aware_sanitize_loss(loss_value, base_loss, layer_id, ratio_i, stage):
+    loss_value, ok = _loss_aware_finite_float(loss_value)
+    if ok:
+        return loss_value
+    base_value, base_ok = _loss_aware_finite_float(base_loss)
+    penalty = (base_value if base_ok else 0.0) + 1e6
+    print(
+        f"[loss-aware] WARNING: non-finite {stage} loss at layer {layer_id:02d}, "
+        f"ratio={float(ratio_i):.6f}; using penalty={penalty:.6e}."
+    )
+    return float(penalty)
+
+
+def _loss_aware_tables_are_finite(layer_tables, layer_full_sizes=None, expected_layers=None):
+    if not isinstance(layer_tables, list) or len(layer_tables) == 0:
+        return False, "layer_tables is empty or not a list"
+    if expected_layers is not None and len(layer_tables) != int(expected_layers):
+        return False, f"layer_tables length {len(layer_tables)} != expected {int(expected_layers)}"
+    if layer_full_sizes is not None:
+        if not isinstance(layer_full_sizes, list) or len(layer_full_sizes) != len(layer_tables):
+            return False, "layer_full_sizes length mismatch"
+        for li, size in enumerate(layer_full_sizes):
+            size_v, ok = _loss_aware_finite_float(size)
+            if (not ok) or int(size_v) <= 0:
+                return False, f"invalid layer_full_sizes[{li}]={size}"
+    required = ("ratio", "cost", "delta")
+    for li, table in enumerate(layer_tables):
+        if not isinstance(table, list) or len(table) == 0:
+            return False, f"layer {li:02d} table is empty or not a list"
+        for ci, item in enumerate(table):
+            if not isinstance(item, dict):
+                return False, f"layer {li:02d} candidate {ci} is not a dict"
+            for key in required:
+                if key not in item:
+                    return False, f"layer {li:02d} candidate {ci} missing {key}"
+                value, ok = _loss_aware_finite_float(item[key])
+                if not ok:
+                    return False, f"layer {li:02d} candidate {ci} has non-finite {key}={item[key]}"
+                if key == "cost" and int(value) <= 0:
+                    return False, f"layer {li:02d} candidate {ci} has invalid cost={item[key]}"
+            for key in ("loss", "raw_delta", "reg"):
+                if key in item:
+                    _, ok = _loss_aware_finite_float(item[key])
+                    if not ok:
+                        return False, f"layer {li:02d} candidate {ci} has non-finite {key}={item[key]}"
+    return True, ""
+
+
 def _solve_layerwise_mckp(layer_tables, budget_params, total_full, dp_bins=2000):
     n_layers = len(layer_tables)
     if n_layers == 0:
@@ -2435,7 +2550,14 @@ def _solve_layerwise_mckp(layer_tables, budget_params, total_full, dp_bins=2000)
         items = []
         for ci, entry in enumerate(table):
             cb = max(1, int(math.ceil(entry["cost"] / bin_size)))
-            items.append((ci, cb, float(entry["delta"])))
+            delta = float(entry["delta"])
+            if not math.isfinite(delta):
+                continue
+            items.append((ci, cb, delta))
+        if not items:
+            ci = min(range(len(table)), key=lambda i: int(table[i]["cost"]))
+            cb = max(1, int(math.ceil(table[ci]["cost"] / bin_size)))
+            items.append((ci, cb, 1e30))
         min_bin_sum += min(x[1] for x in items)
         max_bin_sum += max(x[1] for x in items)
         layer_bins.append(items)
@@ -2839,6 +2961,9 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
         max_batches=full_max_batches,
         use_autocast_bf16=use_autocast_bf16,
     )
+    base_loss, base_loss_ok = _loss_aware_finite_float(base_loss)
+    if not base_loss_ok:
+        raise RuntimeError(f"[loss-aware] baseline calibration loss is non-finite: {base_loss}")
     print(f"[loss-aware] baseline calib loss={base_loss:.6f} using {eval_batches} batches (seq_len={eval_seq_len}, batch_size={eval_batch})")
 
     candidates = _loss_aware_candidate_ratios(args)
@@ -2911,15 +3036,28 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                         item["raw_delta"] = raw_delta
                         item["reg"] = reg_i
                         item["delta"] = raw_delta + reg_i
-                table_cache_loaded = True
-                print(f"[loss-aware] loaded layer table cache: {table_cache_path}")
-                for key, actual_val, expected_val, reason in cache_meta_ignored:
+                cache_payload_ok, cache_payload_reason = _loss_aware_tables_are_finite(
+                    layer_tables,
+                    layer_full_sizes=layer_full_sizes,
+                    expected_layers=len(layers),
+                )
+                if cache_payload_ok:
+                    table_cache_loaded = True
+                    print(f"[loss-aware] loaded layer table cache: {table_cache_path}")
+                    for key, actual_val, expected_val, reason in cache_meta_ignored:
+                        print(
+                            f"[loss-aware]   cache meta diff ignored {key}: "
+                            f"cache={_format_cache_value_for_log(actual_val)} "
+                            f"current={_format_cache_value_for_log(expected_val)} "
+                            f"reason={reason}"
+                        )
+                else:
                     print(
-                        f"[loss-aware]   cache meta diff ignored {key}: "
-                        f"cache={_format_cache_value_for_log(actual_val)} "
-                        f"current={_format_cache_value_for_log(expected_val)} "
-                        f"reason={reason}"
+                        f"[loss-aware] table cache contains invalid values, recomputing: "
+                        f"{table_cache_path} ({cache_payload_reason})"
                     )
+                    layer_tables = []
+                    layer_full_sizes = []
             else:
                 print(f"[loss-aware] table cache meta mismatch, recomputing: {table_cache_path}")
                 _print_loss_aware_table_cache_mismatch(cache_obj, table_cache_meta, table_cache_path)
@@ -3141,6 +3279,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                     max_batches=stage1_batches,
                     use_autocast_bf16=use_autocast_bf16,
                 )
+                loss_i = _loss_aware_sanitize_loss(loss_i, base_loss, li, ratio_i, "stage1")
                 coarse_table.append({
                     "ratio": float(ratio_i),
                     "cost": int(cost_i),
@@ -3260,6 +3399,7 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
                 early_stop_loss=stop_loss,
                 early_stop_min_batches=early_stop_min_batches,
             )
+            loss_i = _loss_aware_sanitize_loss(loss_i, base_loss, li, ratio_i, "full")
             layer_best_loss = min(layer_best_loss, loss_i)
             raw_delta_i = float(loss_i - base_loss)
             reg_i = float(ratio_reg * ((float(ratio_i) - float(args.ratio)) ** 2))
@@ -3286,6 +3426,14 @@ def _obtain_loss_aware_layer_ratios(args, model, tokenizer, profiling_mat, cali_
             else:
                 msg = "  ".join([f"r={x['ratio']:.4f}:Δ={x['delta']:+.5f}" for x in table])
             print(f"[loss-aware] layer {li:02d} {msg}")
+
+    tables_ok, tables_reason = _loss_aware_tables_are_finite(
+        layer_tables,
+        layer_full_sizes=layer_full_sizes,
+        expected_layers=len(layers),
+    )
+    if not tables_ok:
+        raise RuntimeError(f"[loss-aware] invalid layer table after evaluation: {tables_reason}")
 
     if table_cache_path and not table_cache_loaded:
         cache_dir = os.path.dirname(table_cache_path)

@@ -2,6 +2,7 @@ import os
 import random
 import torch
 import sys
+import hashlib
 from datasets import load_dataset
 from torch.utils.data.dataset import Dataset
 
@@ -9,11 +10,25 @@ current_path = os.path.dirname(os.path.abspath(__file__))
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
+def _tokenizer_cache_tag(tokenizer):
+    parts = [
+        tokenizer.__class__.__name__,
+        str(getattr(tokenizer, "name_or_path", "")),
+        str(getattr(tokenizer, "vocab_size", "")),
+        str(getattr(tokenizer, "bos_token_id", "")),
+        str(getattr(tokenizer, "eos_token_id", "")),
+        str(getattr(tokenizer, "pad_token_id", "")),
+    ]
+    raw = "|".join(parts)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+
+
 def get_calib_train_data(name, tokenizer, nsamples, seqlen=2048, seed=3, batch_size=1, dataset_cache_dir=None):
     import random
     random.seed(seed)
+    tokenizer_tag = _tokenizer_cache_tag(tokenizer)
     cache_file = (
-        f"cache/{name}_{nsamples}_{seqlen}_{seed}_{batch_size}.pt"
+        f"cache/{name}_{nsamples}_{seqlen}_{seed}_{batch_size}_{tokenizer_tag}.pt"
     )
     nsamples += 1 #############################
     if not os.path.exists("cache"):
