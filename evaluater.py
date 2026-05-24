@@ -26,17 +26,34 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
         for batch in tqdm(test_loader):
             batch = batch.to(device)
             attention_mask = torch.ones_like(batch, device=batch.device)
-            output = model(input_ids=batch, attention_mask=attention_mask, use_cache=False)
+            output = model(
+                input_ids=batch,
+                attention_mask=attention_mask,
+                labels=batch,
+                use_cache=False,
+            )
             lm_logits = output.logits
             if torch.isfinite(lm_logits).all():
                 shift_logits = lm_logits[:, :-1, :].contiguous().float()
                 shift_labels = batch[:, 1:].contiguous().long()
                 
-                loss_fct = torch.nn.CrossEntropyLoss(reduction="sum")
-                loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.view(-1))
                 ntok = int(shift_labels.numel())
-                total_nll += float(loss.item())
+                loss_fct = torch.nn.CrossEntropyLoss(reduction="sum")
+                manual_loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                native_loss = output.loss
+                if native_loss is not None and torch.isfinite(native_loss):
+                    batch_nll = float(native_loss.float().item()) * ntok
+                    manual_mean = float(manual_loss.float().item()) / max(1, ntok)
+                    native_mean = float(native_loss.float().item())
+                    if abs(manual_mean - native_mean) > 1e-3 and first_stats is None:
+                        print(
+                            f"[ppl_eval] WARNING: native/manual loss mismatch on {dataset}: "
+                            f"native={native_mean:.6f}, manual={manual_mean:.6f}"
+                        )
+                else:
+                    batch_nll = float(manual_loss.item())
                 total_tokens += ntok
+                total_nll += batch_nll
                 with torch.no_grad():
                     pred = shift_logits.argmax(dim=-1)
                     correct_tokens += int((pred == shift_labels).sum().item())
@@ -46,6 +63,8 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
                         "logits_shape": tuple(lm_logits.shape),
                         "label_min": int(shift_labels.min().item()),
                         "label_max": int(shift_labels.max().item()),
+                        "native_loss": float(output.loss.float().item()) if output.loss is not None else None,
+                        "manual_loss": float(manual_loss.float().item()) / max(1, ntok),
                         "logits_min": float(lm_logits.float().min().item()),
                         "logits_max": float(lm_logits.float().max().item()),
                     }
