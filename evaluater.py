@@ -18,20 +18,53 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
     ppls = {}
     for dataset in datasets:
         test_loader = get_test_data(dataset, tokenizer, seq_len=model_seq_len, batch_size = batch_size)
-        nlls = []
+        total_nll = 0.0
+        total_tokens = 0
+        skipped_batches = 0
+        correct_tokens = 0
+        first_stats = None
         for batch in tqdm(test_loader):
             batch = batch.to(device)
-            output = model(batch, use_cache=False)
+            attention_mask = torch.ones_like(batch, device=batch.device)
+            output = model(input_ids=batch, attention_mask=attention_mask, use_cache=False)
             lm_logits = output.logits
             if torch.isfinite(lm_logits).all():
-                shift_logits = lm_logits[:, :-1, :].contiguous()
-                shift_labels = batch[:, 1:].contiguous()
+                shift_logits = lm_logits[:, :-1, :].contiguous().float()
+                shift_labels = batch[:, 1:].contiguous().long()
                 
-                loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+                loss_fct = torch.nn.CrossEntropyLoss(reduction="sum")
                 loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                nlls.append(loss)
-        ppl = np.exp(torch.cat(nlls, dim=-1).mean().item())
+                ntok = int(shift_labels.numel())
+                total_nll += float(loss.item())
+                total_tokens += ntok
+                with torch.no_grad():
+                    pred = shift_logits.argmax(dim=-1)
+                    correct_tokens += int((pred == shift_labels).sum().item())
+                if first_stats is None:
+                    first_stats = {
+                        "batch_shape": tuple(batch.shape),
+                        "logits_shape": tuple(lm_logits.shape),
+                        "label_min": int(shift_labels.min().item()),
+                        "label_max": int(shift_labels.max().item()),
+                        "logits_min": float(lm_logits.float().min().item()),
+                        "logits_max": float(lm_logits.float().max().item()),
+                    }
+            else:
+                skipped_batches += 1
+        if total_tokens <= 0:
+            raise RuntimeError(f"No finite logits were evaluated for {dataset}; skipped_batches={skipped_batches}.")
+        mean_nll = total_nll / max(1, total_tokens)
+        ppl = float(np.exp(mean_nll))
         ppls[dataset] = ppl
+        if ppl < 1.01:
+            acc = correct_tokens / max(1, total_tokens)
+            print(
+                f"[ppl_eval] WARNING: suspicious near-perfect PPL on {dataset}: "
+                f"mean_nll={mean_nll:.8f}, next_token_acc={acc:.6f}, "
+                f"total_tokens={total_tokens}, skipped_batches={skipped_batches}, stats={first_stats}"
+            )
+        elif skipped_batches > 0:
+            print(f"[ppl_eval] WARNING: skipped {skipped_batches} non-finite batches on {dataset}.")
     print("PPL after pruning: {}".format(ppls))
     print("Weight Memory: {} MiB\n".format(torch.cuda.memory_allocated()/1024/1024))
 
@@ -158,4 +191,3 @@ def eff_eval(model, tokenizer, dataset='wikitext2', original_len=4, generated_le
     print("Weight Memory: {} GB".format(weight_memory/(1024 ** 3)))
     print("Activation Memory: {} GB".format((end_memory - start_memory)/(1024 ** 3)))
     print("Throughput: {} tokens/sec".format(token_num / throughput))
-
