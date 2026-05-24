@@ -896,11 +896,54 @@ def _module_rank_overrides(args):
     return overrides if overrides else None
 
 
+def _first_nonfinite_parameter(module):
+    for name, param in module.named_parameters():
+        if not torch.isfinite(param).all():
+            return name
+    return None
+
+
 def _save_model_fp16(model, tokenizer, path):
     prev_dtype = next(iter(model.parameters())).dtype
+    bad_name = _first_nonfinite_parameter(model)
+    if bad_name is not None:
+        raise RuntimeError(
+            f"[save] model contains non-finite parameter before fp16 conversion: {bad_name}. "
+            "Abort saving; inspect the layer update that produced this parameter."
+        )
     model = model.to(torch.float16)
+    bad_name = _first_nonfinite_parameter(model)
+    if bad_name is not None:
+        print(
+            f"[save] WARNING: fp16 conversion produced non-finite parameter {bad_name}; "
+            f"saving in previous dtype={prev_dtype} instead."
+        )
+        model = model.to(prev_dtype)
     torch.save({'model': model, 'tokenizer': tokenizer}, path)
     model = model.to(prev_dtype)
+
+
+def _prepare_lowrank_factors_for_dtype(svd_u, svd_v, dtype, name="", debug=False):
+    u = torch.nan_to_num(svd_u.float(), nan=0.0, posinf=6e4, neginf=-6e4)
+    v = torch.nan_to_num(svd_v.float(), nan=0.0, posinf=6e4, neginf=-6e4)
+    if dtype == torch.float16:
+        cap = 6.0e4
+        eps = 1e-12
+        u_abs = u.abs().amax(dim=0).clamp_min(eps)
+        v_abs = v.abs().amax(dim=1).clamp_min(eps)
+        scale = torch.sqrt(v_abs / u_abs)
+        lower = (v_abs / cap).clamp_min(eps)
+        upper = (cap / u_abs).clamp_min(eps)
+        scale = torch.where(lower <= upper, torch.clamp(scale, min=lower, max=upper), scale)
+        u = u * scale.unsqueeze(0)
+        v = v / scale.unsqueeze(1)
+        max_abs = max(float(u.abs().max().item()), float(v.abs().max().item()))
+        if max_abs > cap:
+            if debug:
+                print(f"[debug] {name} low-rank factors exceed fp16 cap after balancing: max_abs={max_abs:.3e}; clamping.")
+            u = torch.clamp(u, min=-cap, max=cap)
+            v = torch.clamp(v, min=-cap, max=cap)
+    return u.to(dtype), v.to(dtype)
 
 
 def _print_layer_compression_stats(prefix, layer_id, full_params, low_params, cost_sum, rank_values):
@@ -1071,8 +1114,13 @@ def whitening(
             truc_sigma = torch.diag(truc_s)
             #### Replace Attn, MLP ####
             sqrtSigma = torch.sqrt(truc_sigma)
-            svd_u = torch.matmul(truc_u, sqrtSigma).cpu().to(dtype)
-            svd_v = torch.matmul(sqrtSigma, truc_v).cpu().to(dtype)
+            svd_u, svd_v = _prepare_lowrank_factors_for_dtype(
+                torch.matmul(truc_u, sqrtSigma).cpu(),
+                torch.matmul(sqrtSigma, truc_v).cpu(),
+                dtype,
+                name=f"layer {i:02d} {name}",
+                debug=debug_svd,
+            )
             if is_opt:
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
@@ -1429,12 +1477,25 @@ def whitening_local_update(
             sqrt_sigma = torch.sqrt(gpts[name].truc_sigma)
             svd_u = gpts[name].truc_u.matmul(sqrt_sigma)
             svd_v = sqrt_sigma.matmul(gpts[name].truc_v)
-            return svd_u.to(dtype), svd_v.to(dtype)
+            return _prepare_lowrank_factors_for_dtype(
+                svd_u,
+                svd_v,
+                dtype,
+                name=name,
+                debug=debug_svd,
+            )
 
         def _solve_and_assign(names):
             for solve_name in names:
                 svd_u, svd_v = gpts[solve_name].fasterprune()
-                _assign_svd_factor(solve_name, svd_u.to(dtype), svd_v.to(dtype))
+                svd_u, svd_v = _prepare_lowrank_factors_for_dtype(
+                    svd_u,
+                    svd_v,
+                    dtype,
+                    name=solve_name,
+                    debug=debug_svd,
+                )
+                _assign_svd_factor(solve_name, svd_u, svd_v)
 
         def _get_svd_pair(name):
             if is_opt:
@@ -1749,6 +1810,13 @@ def whitening_local_update(
             outs = _layer_forward_chunked(layer, inps, attention_masks, position_ids)
         else:
             outs = _layer_forward_chunked(layer, inps, attention_masks, None)
+        if not torch.isfinite(outs).all():
+            bad_param = _first_nonfinite_parameter(layer)
+            bad_msg = f"; first non-finite parameter={bad_param}" if bad_param is not None else ""
+            raise RuntimeError(
+                f"[local-update] non-finite compressed output at layer {i:02d} "
+                f"(model={model_name}, propagation_aware={propagation_aware_update}){bad_msg}."
+            )
         layers[i] = layer.cpu()
         del gpts
         torch.cuda.empty_cache()
