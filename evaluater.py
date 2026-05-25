@@ -6,16 +6,134 @@ import itertools
 from utils.data_utils import get_test_data
 import os
 import sys
+import gc
 
 current_path = os.path.dirname(os.path.abspath(__file__))
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
+
+def _dense_from_lowrank_pair(v_proj, u_proj):
+    """Materialize u_proj(v_proj(x)) as one dense Linear for faster eval."""
+    if isinstance(u_proj, torch.nn.Identity):
+        return v_proj
+    if not isinstance(v_proj, torch.nn.Linear) or not isinstance(u_proj, torch.nn.Linear):
+        return None
+
+    device = v_proj.weight.device
+    dtype = v_proj.weight.dtype
+    has_bias = u_proj.bias is not None
+    dense = torch.nn.Linear(
+        v_proj.in_features,
+        u_proj.out_features,
+        bias=has_bias,
+        device=device,
+        dtype=dtype,
+    )
+    with torch.no_grad():
+        dense.weight.copy_(u_proj.weight.float().matmul(v_proj.weight.float()).to(dtype))
+        if has_bias:
+            dense.bias.copy_(u_proj.bias.to(dtype))
+    return dense
+
+
+def _materialize_lowrank_module(module):
+    if not hasattr(module, "v_proj") or not hasattr(module, "u_proj"):
+        return None
+    return _dense_from_lowrank_pair(module.v_proj, module.u_proj)
+
+
+def materialize_svd_attention_to_dense(model):
+    """
+    Convert only attention low-rank projections to dense Linear for evaluation.
+
+    This keeps MLP projections low-rank, but removes the two-GEMM overhead from
+    q/k/v/o attention projections. It is mathematically equivalent up to normal
+    floating-point associativity differences.
+    """
+    converted = 0
+    for module in model.modules():
+        # LLaMA/Mistral SVD attention modules call q_u_proj(q_v_proj(x))
+        # directly, so replace the V projection with a dense projection and
+        # make the U projection an identity.
+        for prefix in ("q", "k", "v", "o"):
+            v_name = f"{prefix}_v_proj"
+            u_name = f"{prefix}_u_proj"
+            if not hasattr(module, v_name) or not hasattr(module, u_name):
+                continue
+            dense = _dense_from_lowrank_pair(getattr(module, v_name), getattr(module, u_name))
+            if dense is None:
+                continue
+            setattr(module, v_name, dense)
+            setattr(module, u_name, torch.nn.Identity())
+            converted += 1
+
+        # OPT SVD attention uses HuggingFace's forward and stores low-rank
+        # projections as q_proj/k_proj/v_proj/out_proj modules.
+        for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
+            child = getattr(module, name, None)
+            dense = _materialize_lowrank_module(child)
+            if dense is None:
+                continue
+            setattr(module, name, dense)
+            converted += 1
+    if converted > 0:
+        print(f"[ppl_eval] materialized {converted} attention low-rank projections to dense Linear.")
+    return converted
+
+
+def _get_actual_device(model, fallback="cuda"):
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device(fallback)
+
+
+def _cuda_synchronize_if_needed(device):
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 @torch.no_grad()
-def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_len=2048, batch_size=32, device="cuda"):
+def ppl_eval(
+    model,
+    tokenizer,
+    datasets=['wikitext2', 'ptb', 'c4'],
+    model_seq_len=2048,
+    batch_size=32,
+    device="cuda",
+    materialize_attn_dense=True,
+):
     model.to(device)
     model.eval()
+
+    actual_device = _get_actual_device(model, fallback=device)
+    if actual_device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(actual_device)
+        pure_lowrank_weight_memory_mib = torch.cuda.memory_allocated(actual_device) / (1024 ** 2)
+    else:
+        pure_lowrank_weight_memory_mib = 0.0
+
+    materialized_count = 0
+    if materialize_attn_dense:
+        materialized_count = materialize_svd_attention_to_dense(model)
+        gc.collect()
+        if actual_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if actual_device.type == "cuda":
+        materialized_weight_memory_mib = torch.cuda.memory_allocated(actual_device) / (1024 ** 2)
+        torch.cuda.reset_peak_memory_stats(actual_device)
+    else:
+        materialized_weight_memory_mib = pure_lowrank_weight_memory_mib
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100
+    loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=pad_id)
     ppls = {}
+    total_effective_tokens = 0
+    total_inference_time = 0.0
     for dataset in datasets:
         test_loader = get_test_data(dataset, tokenizer, seq_len=model_seq_len, batch_size = batch_size)
         total_nll = 0.0
@@ -23,48 +141,49 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
         skipped_batches = 0
         correct_tokens = 0
         first_stats = None
-        for batch in tqdm(test_loader):
-            batch = batch.to(device)
-            attention_mask = torch.ones_like(batch, device=batch.device)
+        for batch in tqdm(test_loader, desc=f"Evaluating {dataset}"):
+            batch = batch.to(actual_device)
+            if tokenizer.pad_token_id is None:
+                attention_mask = torch.ones_like(batch, device=batch.device)
+            else:
+                attention_mask = batch.ne(tokenizer.pad_token_id).long()
+            total_effective_tokens += int(attention_mask.sum().item())
+
+            _cuda_synchronize_if_needed(actual_device)
+            start_time = time.time()
             output = model(
                 input_ids=batch,
                 attention_mask=attention_mask,
-                labels=batch,
                 use_cache=False,
             )
+            _cuda_synchronize_if_needed(actual_device)
+            total_inference_time += time.time() - start_time
+
             lm_logits = output.logits
             if torch.isfinite(lm_logits).all():
                 shift_logits = lm_logits[:, :-1, :].contiguous().float()
                 shift_labels = batch[:, 1:].contiguous().long()
+                valid_mask = shift_labels.ne(pad_id).reshape(-1)
                 
-                ntok = int(shift_labels.numel())
-                loss_fct = torch.nn.CrossEntropyLoss(reduction="sum")
-                manual_loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                native_loss = output.loss
-                if native_loss is not None and torch.isfinite(native_loss):
-                    batch_nll = float(native_loss.float().item()) * ntok
-                    manual_mean = float(manual_loss.float().item()) / max(1, ntok)
-                    native_mean = float(native_loss.float().item())
-                    if abs(manual_mean - native_mean) > 1e-3 and first_stats is None:
-                        print(
-                            f"[ppl_eval] WARNING: native/manual loss mismatch on {dataset}: "
-                            f"native={native_mean:.6f}, manual={manual_mean:.6f}"
-                        )
-                else:
-                    batch_nll = float(manual_loss.item())
+                loss = loss_fct(
+                    shift_logits.reshape(-1, shift_logits.size(-1)),
+                    shift_labels.reshape(-1),
+                )
+                valid_loss = loss[valid_mask]
+                ntok = int(valid_mask.sum().item())
+                batch_nll = float(valid_loss.sum().item())
                 total_tokens += ntok
                 total_nll += batch_nll
                 with torch.no_grad():
                     pred = shift_logits.argmax(dim=-1)
-                    correct_tokens += int((pred == shift_labels).sum().item())
-                if first_stats is None:
+                    correct_tokens += int(((pred == shift_labels) & shift_labels.ne(pad_id)).sum().item())
+                if first_stats is None and ntok > 0:
                     first_stats = {
                         "batch_shape": tuple(batch.shape),
                         "logits_shape": tuple(lm_logits.shape),
                         "label_min": int(shift_labels.min().item()),
                         "label_max": int(shift_labels.max().item()),
-                        "native_loss": float(output.loss.float().item()) if output.loss is not None else None,
-                        "manual_loss": float(manual_loss.float().item()) / max(1, ntok),
+                        "manual_loss": float(valid_loss.float().mean().item()) if valid_loss.numel() > 0 else None,
                         "logits_min": float(lm_logits.float().min().item()),
                         "logits_max": float(lm_logits.float().max().item()),
                     }
@@ -84,8 +203,27 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
             )
         elif skipped_batches > 0:
             print(f"[ppl_eval] WARNING: skipped {skipped_batches} non-finite batches on {dataset}.")
-    print("PPL after pruning: {}".format(ppls))
-    print("Weight Memory: {} MiB\n".format(torch.cuda.memory_allocated()/1024/1024))
+    effective_tokens_per_second = (
+        total_effective_tokens / total_inference_time
+        if total_inference_time > 0
+        else 0.0
+    )
+    if actual_device.type == "cuda":
+        peak_memory_mib = torch.cuda.max_memory_allocated(actual_device) / (1024 ** 2)
+    else:
+        peak_memory_mib = 0.0
+
+    print("\n" + "=" * 50)
+    print("Evaluation Results:")
+    print(f"PPL: {ppls}")
+    eval_graph = "attention dense materialized" if materialize_attn_dense else "pure low-rank"
+    print(f"Effective Throughput ({eval_graph}): {effective_tokens_per_second:.2f} tokens/s (Excluding Padding)")
+    print(f"Materialized Attention Projections: {materialized_count}")
+    print(f"Model Weight Memory (Pure Low-Rank FP16): {pure_lowrank_weight_memory_mib:.2f} MiB")
+    print(f"Model Weight Memory (After Attention Dense Materialization FP16): {materialized_weight_memory_mib:.2f} MiB")
+    print(f"Peak VRAM Usage (Total): {peak_memory_mib:.2f} MiB")
+    print("=" * 50 + "\n")
+    return ppls
 
 # only call this function when for 65b or more model    
 @torch.no_grad()
